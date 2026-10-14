@@ -181,6 +181,73 @@ __global__ void lnorm_k(const int32_t* __restrict__ X, int C, const i64* __restr
     }
 }
 
+// ---------------------------------------------------------------- fused row kernels with quantised output
+// Row of C values held in registers (R per thread): max|v| -> e -> hi/lo.
+template <int R> __device__ __forceinline__ void quant_row_out(const int* v, int cnt, int C, int8_t* h, int8_t* l, int32_t* e, int Kp, i64* sh) {
+    u32 m = 0;
+    for (int j = 0; j < cnt; ++j) m = max(m, iabs32(v[j]));
+    m = block_reduce<u32>(m, UMaxOp(), 0u, (u32*)sh);
+    int ee = row_exp(m);
+    if (threadIdx.x == 0) *e = ee;
+    int j = 0;
+    for (int c = threadIdx.x; c < C; c += NT, ++j) { i64 q = quant16(v[j], ee); int8_t a, b; split16(q, a, b); h[c] = a; l[c] = b; }
+    for (int c = C + threadIdx.x; c < Kp; c += NT) { h[c] = 0; l[c] = -128; }
+}
+template <int R>
+__global__ void lnorm_q_k(const int32_t* __restrict__ X, int C, const i64* __restrict__ g, const i64* __restrict__ beta, i64 den, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, int Kp) {
+    __shared__ i64 sh[32];
+    const int32_t* x = X + size_t(blockIdx.x) * C;
+    int v[R]; int cnt = 0;
+    i64 sum = 0; int mn = INT_MAX, mx = INT_MIN;
+    for (int c = threadIdx.x; c < C; c += NT) { int t = x[c]; v[cnt++] = t; sum += t; mn = min(mn, t); mx = max(mx, t); }
+    sum = block_reduce<i64>(sum, SumOp(), 0, sh); mn = block_reduce<int>(mn, MinOp(), INT_MAX, (int*)sh); mx = block_reduce<int>(mx, MaxOp(), INT_MIN, (int*)sh);
+    i64 n = C, mean = floor_div(sum + n / 2, n);
+    int ex = max(0, row_exp(max(mx - mean, mean - mn)) - 5);
+    i64 ss = 0;
+    for (int j = 0; j < cnt; ++j) { i64 dd = rshr(i64(v[j]) - mean, ex); ss += dd * dd; }
+    ss = block_reduce<i64>(ss, SumOp(), 0, sh);
+    i64 var = floor_div(ss, n);
+    int shb = 32 - 2 * ex; i64 one = shb >= 0 ? (1LL << shb) : 0;
+    i64 eps = floor_div(one + den / 2, den);
+    i64 sd = isqrt_i64((var + eps) << 16);
+    cnt = 0;
+    for (int c = threadIdx.x; c < C; c += NT, ++cnt) {
+        i64 d = i64(v[cnt]) - mean;
+        i64 yy = floor_div(d * (1LL << (24 - ex)) * 2 + sd, 2 * sd);
+        v[cnt] = int(sat32(rshr(yy * g[c], 16) + beta[c]));
+    }
+    quant_row_out<R>(v, cnt, C, hi + size_t(blockIdx.x) * Kp, lo + size_t(blockIdx.x) * Kp, e + blockIdx.x, Kp, sh);
+}
+template <int R>
+__global__ void gn_apply_row_k(const int32_t* __restrict__ X, int T, int C, int groups, const GnStat* __restrict__ gs, const i64* __restrict__ g, const i64* __restrict__ beta, const i64* __restrict__ Lsig,
+                               int32_t* __restrict__ Y, u32* __restrict__ pm, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, int Kp) {
+    __shared__ i64 sh[32];
+    size_t row = blockIdx.x; int b = int(row / T); int cg = C / groups;
+    const int32_t* x = X + row * C;
+    int v[R]; int cnt = 0; u32 m = 0;
+    for (int c = threadIdx.x; c < C; c += NT, ++cnt) {
+        GnStat st = gs[b * groups + c / cg];
+        i64 d = i64(x[c]) - st.mean;
+        i64 yy = floor_div(d * (1LL << (24 - st.e)) * 2 + st.sd, 2 * st.sd);
+        i64 y = sat32(rshr(yy * g[c], 16) + beta[c]);
+        if (Lsig) y = sat32(rshr(y * lut16(y, Lsig), 16));
+        v[cnt] = int(y); m = max(m, iabs32(int(y)));
+    }
+    if (hi) { quant_row_out<R>(v, cnt, C, hi + row * Kp, lo + row * Kp, e + row, Kp, sh); return; }
+    int32_t* y = Y + row * C; cnt = 0;
+    for (int c = threadIdx.x; c < C; c += NT) y[c] = v[cnt++];
+    m = block_reduce<u32>(m, UMaxOp(), 0u, (u32*)sh);
+    if (threadIdx.x == 0) pm[row] = m;
+}
+template <int R>
+__global__ void geglu_q_k(const int32_t* __restrict__ A, const int32_t* __restrict__ G, int C, const i64* __restrict__ L, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, int Kp) {
+    __shared__ i64 sh[32];
+    size_t row = blockIdx.x; const int32_t* a = A + row * C; const int32_t* gg = G + row * C;
+    int v[R]; int cnt = 0;
+    for (int c = threadIdx.x; c < C; c += NT, ++cnt) { i64 x = gg[c]; i64 ge = sat32(rshr(x * lut16(x, L), 16)); v[cnt] = int(sat32(rshr(i64(a[c]) * ge, 16))); }
+    quant_row_out<R>(v, cnt, C, hi + row * Kp, lo + row * Kp, e + row, Kp, sh);
+}
+
 // ---------------------------------------------------------------- elementwise
 __global__ void act_k(int32_t* X, size_t n, const i64* __restrict__ L) { size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; if (i < n) { i64 x = X[i]; X[i] = int32_t(sat32(rshr(x * lut16(x, L), 16))); } }
 __global__ void geglu_k(int32_t* A, const int32_t* __restrict__ G, size_t n, const i64* __restrict__ L) {
@@ -426,4 +493,14 @@ void k_attn_out(cudaStream_t st, const int32_t* Ohh, const int32_t* Ohl, const i
     attn_out_k<<<gridFor(size_t(B) * heads * Qc * 64), NT, 0, st>>>(Ohh, Ohl, Olh, Oll, phs, pls, vsum, ev, B, heads, Tq, q0, Qc, C, out);
 }
 void k_zero(cudaStream_t st, void* p, size_t bytes) { cudaMemsetAsync(p, 0, bytes, st); }
+#define ROWDISPATCH(C, KERN, ...) do { if (C <= 4 * NT) KERN<4><<<__VA_ARGS__; else if (C <= 8 * NT) KERN<8><<<__VA_ARGS__; else if (C <= 12 * NT) KERN<12><<<__VA_ARGS__; else if (C <= 20 * NT) KERN<20><<<__VA_ARGS__; else throw std::runtime_error("row kernel: C too large"); } while (0)
+void k_lnorm_q(cudaStream_t st, const int32_t* X, int M, int C, const i64* g, const i64* beta, i64 den, int8_t* hi, int8_t* lo, int32_t* e, int Kp) {
+    ROWDISPATCH(C, lnorm_q_k, M, NT, 0, st>>>(X, C, g, beta, den, hi, lo, e, Kp));
+}
+void k_gn_apply_row(cudaStream_t st, const int32_t* X, int B, int T, int C, int groups, const GnStat* gs, const i64* g, const i64* beta, const i64* Lsig, int32_t* Y, uint32_t* pm, int8_t* hi, int8_t* lo, int32_t* e, int Kp) {
+    ROWDISPATCH(C, gn_apply_row_k, unsigned(size_t(B) * T), NT, 0, st>>>(X, T, C, groups, gs, g, beta, Lsig, Y, pm, hi, lo, e, Kp));
+}
+void k_geglu_q(cudaStream_t st, const int32_t* A, const int32_t* G, int M, int C, const i64* Lphi, int8_t* hi, int8_t* lo, int32_t* e, int Kp) {
+    ROWDISPATCH(C, geglu_q_k, M, NT, 0, st>>>(A, G, C, Lphi, hi, lo, e, Kp));
+}
 }  // namespace meow

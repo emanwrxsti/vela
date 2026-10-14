@@ -91,30 +91,78 @@ Engine::~Engine() {
 }
 
 // ------------------------------------------------------------------ ops
-Tensor Engine::lin(const Tensor& x, const Lin& L, int32_t* out, const int32_t* residual) {
-    if (x.C != L.K) throw std::runtime_error("lin: K mismatch " + std::to_string(x.C) + " vs " + std::to_string(L.K));
-    int rows = x.B * x.T, Mp = int(align_up(rows, 32));
-    Tensor y; y.B = x.B; y.T = x.T; y.C = L.N; y.d = out ? out : (int32_t*)arena_.alloc(y.n() * 4);
+QuantIn Engine::qalloc(int B, int T, int K) {
+    QuantIn q; q.B = B; q.T = T; q.K = K; q.Kp = int(align_up(K, 16)); q.Mp = int(align_up(B * T, 32));
+    q.hi = (int8_t*)arena_.alloc(size_t(2) * q.Mp * q.Kp); q.lo = q.hi + size_t(q.Mp) * q.Kp;      // stacked [hi; lo] -> one GEMM
+    q.e = (int32_t*)arena_.alloc(size_t(q.Mp) * 4);
+    return q;
+}
+Tensor Engine::linQ(const QuantIn& q, const Lin& L, int32_t* out, const int32_t* residual) {
+    if (q.K != L.K || q.Kp != L.Kp) throw std::runtime_error("linQ: K mismatch " + std::to_string(q.K) + " vs " + std::to_string(L.K));
+    int rows = q.rows(), Mp = q.Mp;
+    Tensor y; y.B = q.B; y.T = q.T; y.C = L.N; y.d = out ? out : (int32_t*)arena_.alloc(y.n() * 4);
     size_t mk = arena_.mark();
-    int8_t* hi = (int8_t*)arena_.alloc(size_t(2) * Mp * L.Kp); int8_t* lo = hi + size_t(Mp) * L.Kp;      // stacked [hi; lo] -> one GEMM
-    int32_t* e = (int32_t*)arena_.alloc(size_t(Mp) * 4);
     int32_t* Chi = (int32_t*)arena_.alloc(size_t(2) * Mp * L.Np * 4); int32_t* Clo = Chi + size_t(Mp) * L.Np;
-    k_quant_rows(st_, x.d, rows, L.K, L.K, hi, lo, e, L.Kp);
-    gemm_.run(st_, hi, L.Kp, 0, L.w, L.Kp, 0, Chi, L.Np, 0, 2 * Mp, L.Np, L.Kp);
-    k_epilogue(st_, Chi, Clo, rows, L.N, L.Np, L.wsum, L.m, L.s, L.b, e, y.d, L.N, residual);
+    gemm_.run(st_, q.hi, L.Kp, 0, L.w, L.Kp, 0, Chi, L.Np, 0, 2 * Mp, L.Np, L.Kp);
+    k_epilogue(st_, Chi, Clo, rows, L.N, L.Np, L.wsum, L.m, L.s, L.b, q.e, y.d, L.N, residual);
     arena_.release(mk);
     return y;
 }
-Tensor Engine::conv3(const Tensor& x, int H, int W, const Lin& L, int stride, int32_t* out, const int32_t* residual) {
+Tensor Engine::lin(const Tensor& x, const Lin& L, int32_t* out, const int32_t* residual) {
+    if (x.C != L.K) throw std::runtime_error("lin: K mismatch " + std::to_string(x.C) + " vs " + std::to_string(L.K));
+    size_t mk = arena_.mark();
+    Tensor y; y.B = x.B; y.T = x.T; y.C = L.N; y.d = out ? out : (int32_t*)arena_.alloc(y.n() * 4);
+    size_t mk2 = arena_.mark();
+    QuantIn q = qalloc(x.B, x.T, x.C);
+    k_quant_rows(st_, x.d, q.rows(), L.K, L.K, q.hi, q.lo, q.e, L.Kp);
+    linQ(q, L, y.d, residual);
+    arena_.release(mk2); (void)mk;
+    return y;
+}
+QuantIn Engine::layernormQ(const Tensor& x, const Norm& nm) {
+    if (nm.C != x.C) throw std::runtime_error("layernormQ: C mismatch");
+    QuantIn q = qalloc(x.B, x.T, x.C);
+    k_lnorm_q(st_, x.d, q.rows(), x.C, nm.g, nm.beta, nm.den, q.hi, q.lo, q.e, q.Kp);
+    return q;
+}
+QuantIn Engine::groupnormQ(const Tensor& x, const Norm& nm) {
+    if (nm.C != x.C) throw std::runtime_error("groupnormQ: C mismatch");
+    QuantIn q = qalloc(x.B, x.T, x.C);
+    size_t mk = arena_.mark();
+    GnStat* gs = (GnStat*)arena_.alloc(sizeof(GnStat) * x.B * 32);
+    k_gn_stats1(st_, x.d, x.B, x.T, x.C, 32, gs);
+    k_gn_stats2(st_, x.d, x.B, x.T, x.C, 32, nm.den, gs);
+    k_gn_apply_row(st_, x.d, x.B, x.T, x.C, 32, gs, nm.g, nm.beta, nullptr, nullptr, nullptr, q.hi, q.lo, q.e, q.Kp);
+    arena_.release(mk);
+    return q;
+}
+Tensor Engine::groupnormSilu(const Tensor& x, const Norm& nm, u32*& pm) {
+    if (nm.C != x.C) throw std::runtime_error("groupnormSilu: C mismatch");
+    Tensor y = talloc(x.B, x.T, x.C);
+    pm = (u32*)arena_.alloc(size_t(x.B) * x.T * 4);
+    size_t mk = arena_.mark();
+    GnStat* gs = (GnStat*)arena_.alloc(sizeof(GnStat) * x.B * 32);
+    k_gn_stats1(st_, x.d, x.B, x.T, x.C, 32, gs);
+    k_gn_stats2(st_, x.d, x.B, x.T, x.C, 32, nm.den, gs);
+    k_gn_apply_row(st_, x.d, x.B, x.T, x.C, 32, gs, nm.g, nm.beta, dm_.lutSigmoid, y.d, pm, nullptr, nullptr, nullptr, 0);
+    arena_.release(mk);
+    return y;
+}
+QuantIn Engine::gegluQ(const Tensor& a, const Tensor& g) {
+    QuantIn q = qalloc(a.B, a.T, a.C);
+    k_geglu_q(st_, a.d, g.d, q.rows(), a.C, dm_.lutPhi, q.hi, q.lo, q.e, q.Kp);
+    return q;
+}
+Tensor Engine::conv3(const Tensor& x, int H, int W, const Lin& L, int stride, int32_t* out, const int32_t* residual, const u32* pmIn) {
     if (!L.conv3 || x.C * 9 != L.K) throw std::runtime_error("conv3: shape mismatch");
     int Ho = (H - 1) / stride + 1, Wo = (W - 1) / stride + 1; int rows = x.B * Ho * Wo, Mp = int(align_up(rows, 32));
     Tensor y; y.B = x.B; y.T = Ho * Wo; y.C = L.N; y.d = out ? out : (int32_t*)arena_.alloc(y.n() * 4);
     size_t mk = arena_.mark();
-    u32* pm = (u32*)arena_.alloc(size_t(x.B) * H * W * 4);
+    u32* pm = const_cast<u32*>(pmIn);
+    if (!pm) { pm = (u32*)arena_.alloc(size_t(x.B) * H * W * 4); k_pixmax(st_, x.d, x.B * H * W, x.C, pm); }
     int8_t* hi = (int8_t*)arena_.alloc(size_t(2) * Mp * L.Kp); int8_t* lo = hi + size_t(Mp) * L.Kp;
     int32_t* e = (int32_t*)arena_.alloc(size_t(Mp) * 4);
     int32_t* Chi = (int32_t*)arena_.alloc(size_t(2) * Mp * L.Np * 4); int32_t* Clo = Chi + size_t(Mp) * L.Np;
-    k_pixmax(st_, x.d, x.B * H * W, x.C, pm);
     k_im2col3(st_, x.d, pm, x.B, H, W, x.C, stride, hi, lo, e, L.Kp);
     gemm_.run(st_, hi, L.Kp, 0, L.w, L.Kp, 0, Chi, L.Np, 0, 2 * Mp, L.Np, L.Kp);
     k_epilogue(st_, Chi, Clo, rows, L.N, L.Np, L.wsum, L.m, L.s, L.b, e, y.d, L.N, residual);
@@ -192,11 +240,12 @@ Tensor Engine::resnet(const Tensor& x, int H, int W, const std::string& p) {
     const Lin& c1 = dm_.lin(p + ".conv1"); const Lin& c2 = dm_.lin(p + ".conv2");
     Tensor out = talloc(x.B, x.T, c2.N);
     size_t mk = arena_.mark();
-    Tensor h = groupnorm(x, dm_.norm(p + ".norm1")); silu(h);
-    h = conv3(h, H, W, c1, 1);
-    Tensor h2 = groupnorm(h, dm_.norm(p + ".norm2")); silu(h2);
-    if (dm_.hasLin(p + ".conv_shortcut")) { Tensor xs = lin(x, dm_.lin(p + ".conv_shortcut")); conv3(h2, H, W, c2, 1, out.d, xs.d); }
-    else conv3(h2, H, W, c2, 1, out.d, x.d);
+    u32* pm1 = nullptr; u32* pm2 = nullptr;
+    Tensor h = groupnormSilu(x, dm_.norm(p + ".norm1"), pm1);
+    h = conv3(h, H, W, c1, 1, nullptr, nullptr, pm1);
+    Tensor h2 = groupnormSilu(h, dm_.norm(p + ".norm2"), pm2);
+    if (dm_.hasLin(p + ".conv_shortcut")) { Tensor xs = lin(x, dm_.lin(p + ".conv_shortcut")); conv3(h2, H, W, c2, 1, out.d, xs.d, pm2); }
+    else conv3(h2, H, W, c2, 1, out.d, x.d, pm2);
     arena_.release(mk);
     return out;
 }
@@ -204,12 +253,17 @@ Tensor Engine::transformer(const Tensor& x, const std::string& p, int heads) {
     Tensor out = talloc(x.B, x.T, x.C);
     size_t mk = arena_.mark();
     std::string b = p + ".transformer_blocks.0";
-    Tensor h = groupnorm(x, dm_.norm(p + ".norm"));
-    h = lin(h, dm_.lin(p + ".proj_in"));
+    Tensor h = talloc(x.B, x.T, dm_.lin(p + ".proj_in").N);
     {
         size_t m2 = arena_.mark();
-        Tensor n = layernorm(h, dm_.norm(b + ".norm1"));
-        Tensor q = lin(n, dm_.lin(b + ".attn1.to_q")), k = lin(n, dm_.lin(b + ".attn1.to_k")), v = lin(n, dm_.lin(b + ".attn1.to_v"));
+        QuantIn xq = groupnormQ(x, dm_.norm(p + ".norm"));
+        linQ(xq, dm_.lin(p + ".proj_in"), h.d);
+        arena_.release(m2);
+    }
+    {
+        size_t m2 = arena_.mark();
+        QuantIn n = layernormQ(h, dm_.norm(b + ".norm1"));
+        Tensor q = linQ(n, dm_.lin(b + ".attn1.to_q")), k = linQ(n, dm_.lin(b + ".attn1.to_k")), v = linQ(n, dm_.lin(b + ".attn1.to_v"));
         AttnKV kv = quantKV(k, v, heads);
         Tensor a = attention(q, kv, heads, false, q.T);
         lin(a, dm_.lin(b + ".attn1.to_out.0"), h.d, h.d);
@@ -217,8 +271,8 @@ Tensor Engine::transformer(const Tensor& x, const std::string& p, int heads) {
     }
     {
         size_t m2 = arena_.mark();
-        Tensor n = layernorm(h, dm_.norm(b + ".norm2"));
-        Tensor q = lin(n, dm_.lin(b + ".attn2.to_q"));
+        QuantIn n = layernormQ(h, dm_.norm(b + ".norm2"));
+        Tensor q = linQ(n, dm_.lin(b + ".attn2.to_q"));
         auto it = crossKV_.find(b); if (it == crossKV_.end()) throw std::runtime_error("no cross KV for " + b);
         Tensor a = attention(q, it->second, heads, false, q.T);
         lin(a, dm_.lin(b + ".attn2.to_out.0"), h.d, h.d);
@@ -226,10 +280,10 @@ Tensor Engine::transformer(const Tensor& x, const std::string& p, int heads) {
     }
     {
         size_t m2 = arena_.mark();
-        Tensor n = layernorm(h, dm_.norm(b + ".norm3"));
-        Tensor a = lin(n, dm_.lin(b + ".ff.net.0.proj.a")), g = lin(n, dm_.lin(b + ".ff.net.0.proj.g"));
-        k_geglu(st_, a.d, g.d, a.n(), dm_.lutPhi);
-        lin(a, dm_.lin(b + ".ff.net.2"), h.d, h.d);
+        QuantIn n = layernormQ(h, dm_.norm(b + ".norm3"));
+        Tensor a = linQ(n, dm_.lin(b + ".ff.net.0.proj.a")), g = linQ(n, dm_.lin(b + ".ff.net.0.proj.g"));
+        QuantIn aq = gegluQ(a, g);
+        linQ(aq, dm_.lin(b + ".ff.net.2"), h.d, h.d);
         arena_.release(m2);
     }
     lin(h, dm_.lin(p + ".proj_out"), out.d, x.d);
@@ -266,8 +320,9 @@ void Engine::unet(const Tensor& x, Tensor& eps) {
             h = conv3(u, H, W, dm_.lin("unet.up_blocks." + std::to_string(i) + ".upsamplers.0.conv"), 1);
         }
     }
-    Tensor n = groupnorm(h, dm_.norm("unet.conv_norm_out")); silu(n);
-    conv3(n, H, W, dm_.lin("unet.conv_out"), 1, eps.d);
+    u32* pmo = nullptr;
+    Tensor n = groupnormSilu(h, dm_.norm("unet.conv_norm_out"), pmo);
+    conv3(n, H, W, dm_.lin("unet.conv_out"), 1, eps.d, nullptr, pmo);
 }
 Tensor Engine::textEncoder(const std::vector<int>& ids) {
     const int T = 77, Tp = 96, D = 1024;
@@ -279,15 +334,15 @@ Tensor Engine::textEncoder(const std::vector<int>& ids) {
     for (int l = 0; l < 23; ++l) {
         std::string p = "te.layers." + std::to_string(l);
         size_t mk = arena_.mark();
-        Tensor n = layernorm(x, dm_.norm(p + ".layer_norm1"));
-        Tensor q = lin(n, dm_.lin(p + ".self_attn.q_proj")), k = lin(n, dm_.lin(p + ".self_attn.k_proj")), v = lin(n, dm_.lin(p + ".self_attn.v_proj"));
+        QuantIn n = layernormQ(x, dm_.norm(p + ".layer_norm1"));
+        Tensor q = linQ(n, dm_.lin(p + ".self_attn.q_proj")), k = linQ(n, dm_.lin(p + ".self_attn.k_proj")), v = linQ(n, dm_.lin(p + ".self_attn.v_proj"));
         k.T = T; v.T = T;                    // only the 77 real rows are keys/values
         AttnKV kv = quantKV(k, v, 16);
         Tensor a = attention(q, kv, 16, true, T);
         lin(a, dm_.lin(p + ".self_attn.out_proj"), x.d, x.d);
         arena_.release(mk); mk = arena_.mark();
-        n = layernorm(x, dm_.norm(p + ".layer_norm2"));
-        Tensor f = lin(n, dm_.lin(p + ".mlp.fc1")); k_act(st_, f.d, f.n(), dm_.lutPhi);
+        QuantIn n2 = layernormQ(x, dm_.norm(p + ".layer_norm2"));
+        Tensor f = linQ(n2, dm_.lin(p + ".mlp.fc1")); k_act(st_, f.d, f.n(), dm_.lutPhi);
         lin(f, dm_.lin(p + ".mlp.fc2"), x.d, x.d);
         arena_.release(mk);
     }

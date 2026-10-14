@@ -53,6 +53,14 @@ void k_attn_out(cudaStream_t st, const int32_t* Ohh, const int32_t* Ohl, const i
                 const i64* phs, const i64* pls, const i64* vsum, const int32_t* ev,
                 int B, int heads, int Tq, int q0, int Qc, int C, int32_t* out);
 void k_zero(cudaStream_t st, void* p, size_t bytes);
+// Row kernels that emit the quantised GEMM operand directly (hi/lo [*, Kp], e[row]); C <= 5120, Kp >= C.
+void k_lnorm_q(cudaStream_t st, const int32_t* X, int M, int C, const i64* g, const i64* beta, i64 den, int8_t* hi, int8_t* lo, int32_t* e, int Kp);
+// GroupNorm apply (+ optional SiLU); block per pixel row. Either quantised output (hi/lo/e, when hi != nullptr) or int32 Y plus the pixel max pm.
+void k_gn_apply_row(cudaStream_t st, const int32_t* X, int B, int T, int C, int groups, const GnStat* gs, const i64* g, const i64* beta, const i64* Lsig,
+                    int32_t* Y, uint32_t* pm, int8_t* hi, int8_t* lo, int32_t* e, int Kp);
+// a = sat32(rshr(a*gelu(g),16)) quantised per row
+void k_geglu_q(cudaStream_t st, const int32_t* A, const int32_t* G, int M, int C, const i64* Lphi, int8_t* hi, int8_t* lo, int32_t* e, int Kp);
+// 3x3 im2col with a precomputed pixel max (pm) — see k_im2col3
 }  // namespace meow
 namespace meow {
 // Fused exact attention on tensor cores (attn.cu). Tqp, Tkp multiples of 64; K/V operands from k_quant_heads / k_quant_v.

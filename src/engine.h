@@ -40,6 +40,7 @@ struct Arena {
     void reset() { off = 0; }
 };
 
+struct QuantIn { int8_t* hi = nullptr; int8_t* lo = nullptr; int32_t* e = nullptr; int B = 0, T = 0, K = 0, Kp = 0, Mp = 0; int rows() const { return B * T; } };
 struct AttnKV {   // quantised key/value operands of one attention call
     int8_t *khi = nullptr, *klo = nullptr, *vthi = nullptr, *vtlo = nullptr;
     int32_t *ek = nullptr, *ev = nullptr; i64 *ksum = nullptr, *vsum = nullptr;
@@ -75,7 +76,13 @@ private:
     Tensor talloc(int B, int T, int C);
     // ops (all on st_)
     Tensor lin(const Tensor& x, const Lin& L, int32_t* out = nullptr, const int32_t* residual = nullptr);
-    Tensor conv3(const Tensor& x, int H, int W, const Lin& L, int stride, int32_t* out = nullptr, const int32_t* residual = nullptr);
+    QuantIn qalloc(int B, int T, int K);                      // operand buffers for a [B*T, K] row-quantised input
+    Tensor linQ(const QuantIn& q, const Lin& L, int32_t* out = nullptr, const int32_t* residual = nullptr);
+    QuantIn layernormQ(const Tensor& x, const Norm& nm);
+    QuantIn groupnormQ(const Tensor& x, const Norm& nm);
+    Tensor groupnormSilu(const Tensor& x, const Norm& nm, u32*& pm);   // GN + SiLU + pixel max (for conv3)
+    QuantIn gegluQ(const Tensor& a, const Tensor& g);
+    Tensor conv3(const Tensor& x, int H, int W, const Lin& L, int stride, int32_t* out = nullptr, const int32_t* residual = nullptr, const u32* pmIn = nullptr);
     Tensor groupnorm(const Tensor& x, const Norm& nm);
     Tensor layernorm(const Tensor& x, const Norm& nm);
     void silu(Tensor& x);

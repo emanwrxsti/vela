@@ -10,7 +10,7 @@
 
 namespace meow {
 struct Lin { int N = 0, K = 0, Np = 0, Kp = 0; int8_t* w = nullptr; i64 *wsum = nullptr, *m = nullptr, *s = nullptr, *b = nullptr; int4* cst = nullptr; bool conv3 = false; };   // cst[n] = {m, s, b, wsum} packed
-struct Norm { i64 *g = nullptr, *beta = nullptr; i64 den = 0; int C = 0; };
+struct Norm { i64 *g = nullptr, *beta = nullptr; int32_t *g32 = nullptr, *beta32 = nullptr; i64 den = 0; int C = 0; };   // g/beta are Q16 int32 values
 
 /** Weights of one GPU, shared by all lanes on it. */
 class DevModel {
@@ -84,7 +84,6 @@ private:
     QuantIn layernormQ(const Tensor& x, const Norm& nm);
     QuantIn groupnormQ(const Tensor& x, const Norm& nm);
     Tensor groupnormSilu(const Tensor& x, const Norm& nm, u32*& pm);   // GN + SiLU + pixel max (for conv3)
-    QuantIn gegluQ(const Tensor& a, const Tensor& g);
     void linQ3(const QuantIn& q, const Lin& L, int Cs, Tensor& y0, Tensor& y1, Tensor& y2);   // merged GEMM, split epilogue
     QuantIn linQGegluQ(const QuantIn& q, const Lin& L, int F);                                 // merged [a|g] GEMM + GEGLU + quant
     Tensor conv3(const Tensor& x, int H, int W, const Lin& L, int stride, int32_t* out = nullptr, const int32_t* residual = nullptr, const u32* pmIn = nullptr);

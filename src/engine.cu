@@ -48,7 +48,9 @@ void DevModel::load(int dev, const Poisd& model) {
         if (name.size() < 2 || name.compare(name.size() - 2, 2, ".g") != 0) continue;
         std::string base = name.substr(0, name.size() - 2);
         if (!model.has(base + ".beta") || !model.has(base + ".eps")) continue;
-        Norm nm; auto g = model.i32v(name); nm.C = int(g.size()); nm.g = up64(g); nm.beta = up64(model.i32v(base + ".beta")); nm.den = model.i32s(base + ".eps");
+        Norm nm; auto g = model.i32v(name); auto bt = model.i32v(base + ".beta"); nm.C = int(g.size()); nm.g = up64(g); nm.beta = up64(bt); nm.den = model.i32s(base + ".eps");
+        { std::vector<int32_t> h(g.begin(), g.end()); nm.g32 = (int32_t*)dalloc(h.size() * 4); CUDA_CHECK(cudaMemcpy(nm.g32, h.data(), h.size() * 4, cudaMemcpyHostToDevice));
+          std::vector<int32_t> hb(bt.begin(), bt.end()); nm.beta32 = (int32_t*)dalloc(hb.size() * 4); CUDA_CHECK(cudaMemcpy(nm.beta32, hb.data(), hb.size() * 4, cudaMemcpyHostToDevice)); }
         norms_[base] = nm;
     }
     lutSigmoid = up64(model.i32v("lut.sigmoid")); lutPhi = up64(model.i32v("lut.phi"));
@@ -177,7 +179,7 @@ QuantIn Engine::linQGegluQ(const QuantIn& q, const Lin& L, int F) {
 QuantIn Engine::layernormQ(const Tensor& x, const Norm& nm) {
     if (nm.C != x.C) throw std::runtime_error("layernormQ: C mismatch");
     QuantIn q = qalloc(x.B, x.T, x.C);
-    k_lnorm_q(st_, x.d, q.rows(), x.C, nm.g, nm.beta, nm.den, q.hi, q.lo, q.e, q.Kp);
+    k_lnorm_q(st_, x.d, q.rows(), x.C, nm.g32, nm.beta32, nm.den, q.hi, q.lo, q.e, q.Kp);
     return q;
 }
 QuantIn Engine::groupnormQ(const Tensor& x, const Norm& nm) {
@@ -187,7 +189,7 @@ QuantIn Engine::groupnormQ(const Tensor& x, const Norm& nm) {
     GnStat* gs = (GnStat*)arena_.alloc(sizeof(GnStat) * x.B * 32);
     k_gn_stats1(st_, x.d, x.B, x.T, x.C, 32, gs);
     k_gn_stats2(st_, x.d, x.B, x.T, x.C, 32, nm.den, gs);
-    k_gn_apply_row(st_, x.d, x.B, x.T, x.C, 32, gs, nm.g, nm.beta, nullptr, nullptr, nullptr, q.hi, q.lo, q.e, q.Kp);
+    k_gn_apply_row(st_, x.d, x.B, x.T, x.C, 32, gs, nm.g32, nm.beta32, nullptr, nullptr, nullptr, q.hi, q.lo, q.e, q.Kp);
     arena_.release(mk);
     return q;
 }
@@ -199,14 +201,9 @@ Tensor Engine::groupnormSilu(const Tensor& x, const Norm& nm, u32*& pm) {
     GnStat* gs = (GnStat*)arena_.alloc(sizeof(GnStat) * x.B * 32);
     k_gn_stats1(st_, x.d, x.B, x.T, x.C, 32, gs);
     k_gn_stats2(st_, x.d, x.B, x.T, x.C, 32, nm.den, gs);
-    k_gn_apply_row(st_, x.d, x.B, x.T, x.C, 32, gs, nm.g, nm.beta, dm_.lutSigmoid32, y.d, pm, nullptr, nullptr, nullptr, 0);
+    k_gn_apply_row(st_, x.d, x.B, x.T, x.C, 32, gs, nm.g32, nm.beta32, dm_.lutSigmoid32, y.d, pm, nullptr, nullptr, nullptr, 0);
     arena_.release(mk);
     return y;
-}
-QuantIn Engine::gegluQ(const Tensor& a, const Tensor& g) {
-    QuantIn q = qalloc(a.B, a.T, a.C);
-    k_geglu_q(st_, a.d, g.d, q.rows(), a.C, dm_.lutPhi32, q.hi, q.lo, q.e, q.Kp);
-    return q;
 }
 Tensor Engine::conv3(const Tensor& x, int H, int W, const Lin& L, int stride, int32_t* out, const int32_t* residual, const u32* pmIn) {
     if (!L.conv3 || x.C * 9 != L.K) throw std::runtime_error("conv3: shape mismatch");

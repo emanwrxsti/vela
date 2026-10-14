@@ -48,10 +48,17 @@ __device__ __forceinline__ void ldm4(uint32_t* r, const void* rowAddr) {
 __device__ __forceinline__ int pswz(int row, int key) { return row * LDP + (((key >> 4) ^ ((row >> 1) & 3)) << 4) + (key & 15); }
 /** Exact score: s = rshr((hh<<16) + T, sh), saturated to int32. */
 __device__ __forceinline__ int score(int hh, int T, int sh) {
-    i64 S = (i64(hh) << 16) + T;
-    i64 v;
-    if (sh >= 0) v = (S + ((1LL << sh) >> 1)) >> sh;
-    else { int neg = -sh; i64 lim = 1LL << (62 - neg); v = (S < -lim ? -lim : (S > lim ? lim : S)) << neg; }
+    if (sh >= 16) {            // floor((hh*2^16 + T + h) / 2^sh) = (hh + ((T + h) >> 16)) >> (sh-16); |T + h| < 2^31, result < 2^22: pure 32-bit
+        const int h = 1 << (sh - 1);
+        return (hh + ((T + h) >> 16)) >> (sh - 16);
+    }
+    if (sh >= 0) {             // hh*2^16 divisible by 2^sh: s = hh << (16-sh) + rshr(T, sh), saturated
+        const int t = sh ? ((T >> sh) + ((T >> (sh - 1)) & 1)) : T;
+        const i64 v = (i64(hh) << (16 - sh)) + t;
+        return int(v < INT_MIN ? INT_MIN : (v > INT_MAX ? INT_MAX : v));
+    }
+    const i64 S = (i64(hh) << 16) + T;
+    const int neg = -sh; const i64 lim = 1LL << (62 - neg); const i64 v = (S < -lim ? -lim : (S > lim ? lim : S)) << neg;
     return int(v < INT_MIN ? INT_MIN : (v > INT_MAX ? INT_MAX : v));
 }
 /** E = LUT(z) for z = mx - s >= 0 (uint32), 0 when z >= 2^20. Branchless. */

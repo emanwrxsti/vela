@@ -39,6 +39,13 @@ __device__ __forceinline__ void mma_s8(int32_t* c, const uint32_t* a, uint32_t b
                  : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 __device__ __forceinline__ uint32_t ld32(const int8_t* p) { return *reinterpret_cast<const uint32_t*>(p); }
+/** ldmatrix.x4: four 8x16-byte matrices; lane l supplies the row address of matrix l>>3, row l&7. Result reg i = matrix i, row lane>>2, bytes (lane&3)*4. */
+__device__ __forceinline__ void ldm4(uint32_t* r, const void* rowAddr) {
+    unsigned a = unsigned(__cvta_generic_to_shared(rowAddr));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+/** P tile [query][key] (LDP = 64): 16-byte chunk index swizzled by row so 8-row ldmatrix reads are bank-conflict free. */
+__device__ __forceinline__ int pswz(int row, int key) { return row * LDP + (((key >> 4) ^ ((row >> 1) & 3)) << 4) + (key & 15); }
 /** Exact score: s = rshr((hh<<16) + T, sh), saturated to int32. */
 __device__ __forceinline__ int score(int hh, int T, int sh) {
     i64 S = (i64(hh) << 16) + T;
@@ -67,6 +74,7 @@ __global__ void __launch_bounds__(NTHR, (PASS == 2 ? 2 : 3)) attn_pass_k(
     const int g = blockIdx.y, qt = blockIdx.x, q0 = qt * TQ;
     const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31, rw = w & 3, kh = w >> 2;
     const int gid = lane >> 2, t4 = lane & 3;
+    const int lm = lane >> 3, lr = lane & 7;                       // ldmatrix: matrix index, row within matrix
     const int b = g / heads, h = g % heads;
     if (q0 >= Tq) return;
     const size_t rowBase = size_t(g) * Tqp + q0;
@@ -121,9 +129,9 @@ __global__ void __launch_bounds__(NTHR, (PASS == 2 ? 2 : 3)) attn_pass_k(
                 const int nt = kh * 4 + np * 2 + u, kb = nt * 8;
                 for (int j = 0; j < 4; ++j) { hh[u][j] = 0; hl[u][j] = 0; lh[u][j] = 0; ll[u][j] = 0; }
                 for (int ks = 0; ks < 2; ++ks) {
-                    const int8_t* kh_p = Kh + (kb + gid) * LD + ks * 32 + t4 * 4; const int8_t* kl_p = Kl + (kb + gid) * LD + ks * 32 + t4 * 4;
-                    uint32_t bh0 = ld32(kh_p), bh1 = ld32(kh_p + 16), bl0 = ld32(kl_p), bl1 = ld32(kl_p + 16);
-                    mma_s8(hh[u], qa_hi[ks], bh0, bh1); mma_s8(hl[u], qa_hi[ks], bl0, bl1); mma_s8(lh[u], qa_lo[ks], bh0, bh1); mma_s8(ll[u], qa_lo[ks], bl0, bl1);
+                    uint32_t bf[4];      // {bh0, bh1, bl0, bl1}: matrices 0/1 = K hi dims +0/+16, 2/3 = K lo
+                    ldm4(bf, (lm < 2 ? Kh : Kl) + (kb + lr) * LD + ks * 32 + (lm & 1) * 16);
+                    mma_s8(hh[u], qa_hi[ks], bf[0], bf[1]); mma_s8(hl[u], qa_hi[ks], bf[2], bf[3]); mma_s8(lh[u], qa_lo[ks], bf[0], bf[1]); mma_s8(ll[u], qa_lo[ks], bf[2], bf[3]);
                 }
             }
             #pragma unroll
@@ -155,11 +163,11 @@ __global__ void __launch_bounds__(NTHR, (PASS == 2 ? 2 : 3)) attn_pass_k(
                 if (PASS == 1) { sum0 += es0; sum1 += es1; }
                 else if (PASS == 2) {
                     phs0 += phs_t0; pls0 += pls_t0; phs1 += phs_t1; pls1 += pls_t1;
-                    const int c = kb + t4 * 2;
-                    *reinterpret_cast<uint16_t*>(S.phi + row0 * LDP + c) = uint16_t(uint8_t(ph[0]) | (uint16_t(uint8_t(ph[1])) << 8));
-                    *reinterpret_cast<uint16_t*>(S.plo + row0 * LDP + c) = uint16_t(uint8_t(pl[0]) | (uint16_t(uint8_t(pl[1])) << 8));
-                    *reinterpret_cast<uint16_t*>(S.phi + row1 * LDP + c) = uint16_t(uint8_t(ph[2]) | (uint16_t(uint8_t(ph[3])) << 8));
-                    *reinterpret_cast<uint16_t*>(S.plo + row1 * LDP + c) = uint16_t(uint8_t(pl[2]) | (uint16_t(uint8_t(pl[3])) << 8));
+                    const int c = kb + t4 * 2; const int o0 = pswz(row0, c), o1 = pswz(row1, c);
+                    *reinterpret_cast<uint16_t*>(S.phi + o0) = uint16_t(uint8_t(ph[0]) | (uint16_t(uint8_t(ph[1])) << 8));
+                    *reinterpret_cast<uint16_t*>(S.plo + o0) = uint16_t(uint8_t(pl[0]) | (uint16_t(uint8_t(pl[1])) << 8));
+                    *reinterpret_cast<uint16_t*>(S.phi + o1) = uint16_t(uint8_t(ph[2]) | (uint16_t(uint8_t(ph[3])) << 8));
+                    *reinterpret_cast<uint16_t*>(S.plo + o1) = uint16_t(uint8_t(pl[2]) | (uint16_t(uint8_t(pl[3])) << 8));
                 }
             }
         }
@@ -167,14 +175,14 @@ __global__ void __launch_bounds__(NTHR, (PASS == 2 ? 2 : 3)) attn_pass_k(
             cp_wait<0>();                                        // V(kt) (and K(kt+1)) landed
             __syncthreads();                                     // P tile complete, V visible
             for (int ks = 0; ks < 2; ++ks) {
-                const int c0 = ks * 32 + t4 * 4;
-                uint32_t pa_h[4] = {ld32(S.phi + row0 * LDP + c0), ld32(S.phi + row1 * LDP + c0), ld32(S.phi + row0 * LDP + c0 + 16), ld32(S.phi + row1 * LDP + c0 + 16)};
-                uint32_t pa_l[4] = {ld32(S.plo + row0 * LDP + c0), ld32(S.plo + row1 * LDP + c0), ld32(S.plo + row0 * LDP + c0 + 16), ld32(S.plo + row1 * LDP + c0 + 16)};
+                // A fragments of P: matrices 0/1 = rows +0/+8 at keys ks*32+0..15, 2/3 = same rows at keys +16
+                const int prow = rw * 16 + (lm & 1) * 8 + lr, pkey = ks * 32 + (lm >> 1) * 16;
+                uint32_t pa_h[4], pa_l[4];
+                ldm4(pa_h, S.phi + pswz(prow, pkey)); ldm4(pa_l, S.plo + pswz(prow, pkey));
                 for (int nd = 0; nd < 4; ++nd) {
-                    const int d = kh * 32 + nd * 8 + gid;
-                    const int8_t* vh_p = S.vhi + d * LD + c0; const int8_t* vl_p = S.vlo + d * LD + c0;
-                    uint32_t vh0 = ld32(vh_p), vh1 = ld32(vh_p + 16), vl0 = ld32(vl_p), vl1 = ld32(vl_p + 16);
-                    mma_s8(o_hh[nd], pa_h, vh0, vh1); mma_s8(o_mx[nd], pa_h, vl0, vl1); mma_s8(o_mx[nd], pa_l, vh0, vh1); mma_s8(o_ll[nd], pa_l, vl0, vl1);
+                    uint32_t vf[4];      // {vh0, vh1, vl0, vl1}
+                    ldm4(vf, (lm < 2 ? S.vhi : S.vlo) + (kh * 32 + nd * 8 + lr) * LD + ks * 32 + (lm & 1) * 16);
+                    mma_s8(o_hh[nd], pa_h, vf[0], vf[1]); mma_s8(o_mx[nd], pa_h, vf[2], vf[3]); mma_s8(o_mx[nd], pa_l, vf[0], vf[1]); mma_s8(o_ll[nd], pa_l, vf[2], vf[3]);
                 }
             }
         }

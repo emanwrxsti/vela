@@ -11,4 +11,5 @@ void k_gemm_hl(cudaStream_t st, const int8_t* Ahi, const int8_t* Alo, int lda, i
                const int4* cst, const int32_t* e, int32_t* Y, int ldy, const int32_t* residual,
                int epi = EPI_PLAIN, int Cs = 0, int32_t* Y1 = nullptr, int32_t* Y2 = nullptr, const int32_t* Lphi = nullptr);
 bool gemm_hl_supported(int Mp, int Np, int Kp);
+extern int g_gemm_hl_variant;   // -1 auto, 0 64x64, 1 128x64, 2 64x128
 }

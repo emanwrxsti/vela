@@ -25,6 +25,11 @@ int main(int argc, char** argv) {
         const int8_t* Ahi = dA; const int8_t* Alo = dA + size_t(Mp) * Kp;
         auto ref = [&]() { lt.run(st, dA, Kp, 0, dW, Kp, 0, dC, Np32, 0, 2 * Mp, Np32, Kp); k_epilogue(st, dC, dC + size_t(Mp) * Np32, s.M, s.N, Np32, dcst, dE, dY1, s.N, dR); };
         auto mine = [&]() { k_gemm_hl(st, Ahi, Alo, Kp, Mp, s.M, dW, Kp, Np64, s.N, Kp, dcst, dE, dY2, s.N, dR); };
+        float tv[3];
+        for (int v = 0; v < 3; ++v) { g_gemm_hl_variant = v; if ((v == 1 && Mp % 128) || (v == 2 && Np64 % 128)) { tv[v] = -1; continue; } mine(); cudaDeviceSynchronize(); cudaEvent_t a0, a1; cudaEventCreate(&a0); cudaEventCreate(&a1); cudaEventRecord(a0); for (int i = 0; i < 20; ++i) mine(); cudaEventRecord(a1); cudaEventSynchronize(a1); cudaEventElapsedTime(&tv[v], a0, a1); tv[v] /= 20;
+            std::vector<int32_t> yv(hR.size()); cudaMemcpy(yv.data(), dY2, yv.size() * 4, cudaMemcpyDeviceToHost); std::vector<int32_t> yr(hR.size()); lt.run(st, dA, Kp, 0, dW, Kp, 0, dC, Np32, 0, 2 * Mp, Np32, Kp); k_epilogue(st, dC, dC + size_t(Mp) * Np32, s.M, s.N, Np32, dcst, dE, dY1, s.N, dR); cudaMemcpy(yr.data(), dY1, yr.size() * 4, cudaMemcpyDeviceToHost); long bb = 0; for (size_t i = 0; i < yv.size(); ++i) bb += yv[i] != yr[i]; if (bb) printf("  variant %d MISMATCH %ld\n", v, bb); }
+        g_gemm_hl_variant = -1;
+        printf("   variants: 64x64 %.3f  128x64 %.3f  64x128 %.3f ms\n", tv[0], tv[1], tv[2]);
         ref(); mine(); cudaDeviceSynchronize(); cudaError_t err = cudaGetLastError(); if (err != cudaSuccess) { printf("CUDA error %s\n", cudaGetErrorString(err)); return 1; }
         std::vector<int32_t> y1(hR.size()), y2(hR.size()); cudaMemcpy(y1.data(), dY1, y1.size() * 4, cudaMemcpyDeviceToHost); cudaMemcpy(y2.data(), dY2, y2.size() * 4, cudaMemcpyDeviceToHost);
         long bad = 0; for (size_t i = 0; i < y1.size(); ++i) if (y1[i] != y2[i]) { if (!bad) printf("  first mismatch at %zu: ref %d got %d\n", i, y1[i], y2[i]); ++bad; }

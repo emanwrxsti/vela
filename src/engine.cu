@@ -154,6 +154,20 @@ Tensor Engine::linQ(const QuantIn& q, const Lin& L, int32_t* out, const int32_t*
     arena_.release(mk);
     return y;
 }
+uint32_t* Engine::rowmaxAlloc(int rows) { uint32_t* p = (uint32_t*)arena_.alloc(size_t(rows) * 4); cudaMemsetAsync(p, 0, size_t(rows) * 4, st_); return p; }
+Tensor Engine::linX(const Tensor& x, const Lin& L, int32_t* out, const int32_t* residual, int epi, bool wantRowmax) {
+    if (!(cfg_.fusedLoader && x.rowmax && useHl(L) && L.K % 16 == 0)) {
+        if (epi == EPI_GELU) { Tensor y = lin(x, L, out, residual); k_act(st_, y.d, y.n(), dm_.lutPhi32); if (wantRowmax) { QuantIn dummy; (void)dummy; } return y; }
+        return lin(x, L, out, residual);
+    }
+    int rows = x.B * x.T, Mp = int(align_up(rows, 64));
+    Tensor y; y.B = x.B; y.T = x.T; y.C = L.N; y.d = out ? out : (int32_t*)arena_.alloc(y.n() * 4);
+    if (wantRowmax) y.rowmax = rowmaxAlloc(rows);
+    ASrc A; A.src = SRC_X32; A.x = x.d; A.ldx = x.C; A.rowmax = x.rowmax; A.K = L.K;
+    AEpi E; E.epi = epi; E.Y = y.d; E.ldy = L.N; E.residual = residual; E.Lphi = dm_.lutPhi32; E.rowmax = y.rowmax;
+    k_gemm_hl2(st_, A, Mp, rows, L.w, L.Kp, L.Np, L.N, L.Kp, L.cst, E);
+    return y;
+}
 bool Engine::useHl(const Lin& L) const { return cfg_.customGemmMaxK > 0 && L.Kp <= cfg_.customGemmMaxK && gemm_hl_supported(64, L.Np, L.Kp); }
 Tensor Engine::lin(const Tensor& x, const Lin& L, int32_t* out, const int32_t* residual) {
     if (x.C != L.K) throw std::runtime_error("lin: K mismatch " + std::to_string(x.C) + " vs " + std::to_string(L.K));
@@ -195,6 +209,14 @@ QuantIn Engine::linQGegluQ(const QuantIn& q, const Lin& L, int F, const Lin* Li)
     arena_.release(mk);
     return out;
 }
+Tensor Engine::gegluX(const QuantIn& q, const Lin& Li, int F) {
+    int rows = q.rows(), Mp = q.Mp;
+    Tensor v; v.B = q.B; v.T = q.T; v.C = F; v.d = (int32_t*)arena_.alloc(size_t(Mp) * F * 4); v.rowmax = rowmaxAlloc(rows);
+    ASrc A; A.src = SRC_I8; A.hi = q.hi; A.lo = q.lo; A.ld8 = Li.Kp; A.e = q.e;
+    AEpi E; E.epi = EPI_GEGLU; E.Y = v.d; E.ldy = F; E.Lphi = dm_.lutPhi32; E.rowmax = v.rowmax;
+    k_gemm_hl2(st_, A, Mp, rows, Li.w, Li.Kp, Li.Np, Li.N, Li.Kp, Li.cst, E);
+    return v;
+}
 QuantIn Engine::layernormQ(const Tensor& x, const Norm& nm) {
     if (nm.C != x.C) throw std::runtime_error("layernormQ: C mismatch");
     QuantIn q = qalloc(x.B, x.T, x.C);
@@ -231,10 +253,19 @@ Tensor Engine::conv3(const Tensor& x, int H, int W, const Lin& L, int stride, in
     size_t mk = arena_.mark();
     u32* pm = const_cast<u32*>(pmIn);
     if (!pm) { pm = (u32*)arena_.alloc(size_t(x.B) * H * W * 4); k_pixmax(st_, x.d, x.B * H * W, x.C, pm); }
-    int8_t* hi = (int8_t*)arena_.alloc(size_t(2) * Mp * L.Kp); int8_t* lo = hi + size_t(Mp) * L.Kp;
     int32_t* e = (int32_t*)arena_.alloc(size_t(Mp) * 4);
-    int32_t* Chi = (int32_t*)arena_.alloc(size_t(2) * Mp * L.Np * 4); int32_t* Clo = Chi + size_t(Mp) * L.Np;
+    if (cfg_.fusedLoader && useHl(L) && x.C % 16 == 0) {           // implicit im2col inside the GEMM (no int8 planes)
+        k_conv_e(st_, pm, x.B, H, W, stride, e);
+        ASrc A; A.src = SRC_CONV32; A.img = x.d; A.H = H; A.W = W; A.C = x.C; A.stride = stride; A.Ho = Ho; A.Wo = Wo; A.K = L.K; A.e = e;
+        AEpi E; E.epi = EPI_PLAIN; E.Y = y.d; E.ldy = L.N; E.residual = residual;
+        k_gemm_hl2(st_, A, Mp, rows, L.w, L.Kp, L.Np, L.N, L.Kp, L.cst, E);
+        arena_.release(mk);
+        return y;
+    }
+    int8_t* hi = (int8_t*)arena_.alloc(size_t(2) * Mp * L.Kp); int8_t* lo = hi + size_t(Mp) * L.Kp;
     k_im2col3(st_, x.d, pm, x.B, H, W, x.C, stride, hi, lo, e, L.Kp);
+    if (useHl(L)) { k_gemm_hl(st_, hi, lo, L.Kp, Mp, rows, L.w, L.Kp, L.Np, L.N, L.Kp, L.cst, e, y.d, L.N, residual); arena_.release(mk); return y; }
+    int32_t* Chi = (int32_t*)arena_.alloc(size_t(2) * Mp * L.Np * 4); int32_t* Clo = Chi + size_t(Mp) * L.Np;
     gemm_.run(st_, hi, L.Kp, 0, L.w, L.Kp, 0, Chi, L.Np, 0, 2 * Mp, L.Np, L.Kp);
     k_epilogue(st_, Chi, Clo, rows, L.N, L.Np, L.cst, e, y.d, L.N, residual);
     arena_.release(mk);
@@ -276,13 +307,14 @@ Tensor Engine::attention(const Tensor& q, const AttnKV& kv, int heads, bool caus
     if (C != heads * 64) throw std::runtime_error("attention: C != heads*64");
     if (cfg_.fusedAttention) Tqp = int(align_up(q.T, 128));   // works for 64- and 128-query attention blocks
     Tensor out = talloc(B, q.T, C);
+    if (cfg_.fusedAttention && cfg_.fusedLoader) out.rowmax = rowmaxAlloc(B * q.T);
     size_t mk = arena_.mark();
     int8_t* qhi = (int8_t*)arena_.alloc(size_t(G) * Tqp * 64); int8_t* qlo = (int8_t*)arena_.alloc(size_t(G) * Tqp * 64);
     int32_t* eq = (int32_t*)arena_.alloc(size_t(G) * Tqp * 4); i64* qhs = (i64*)arena_.alloc(size_t(G) * Tqp * 8); i64* qls = (i64*)arena_.alloc(size_t(G) * Tqp * 8); i64* qts = (i64*)arena_.alloc(size_t(G) * Tqp * 8);
     k_quant_heads(st_, q.d, B, Tq, C, heads, Tqp, qhi, qlo, eq, qhs, qls, qts);
     if (cfg_.fusedAttention) {
         int32_t* gmx = (int32_t*)arena_.alloc(size_t(G) * Tqp * 4); i64* gr = (i64*)arena_.alloc(size_t(G) * Tqp * 8);
-        k_fused_attention(st_, qhi, qlo, eq, qhs, qls, kv.khi, kv.klo, kv.ek, kv.ksum, kv.vthi, kv.vtlo, kv.ev, kv.vsum, B, heads, Tq, Tqp, kv.Tk, kv.Tkp, causal, dm_.lutExp, C, gmx, gr, out.d);
+        k_fused_attention(st_, qhi, qlo, eq, qhs, qls, kv.khi, kv.klo, kv.ek, kv.ksum, kv.vthi, kv.vtlo, kv.ev, kv.vsum, B, heads, Tq, Tqp, kv.Tk, kv.Tkp, causal, dm_.lutExp, C, gmx, gr, out.d, out.rowmax);
         arena_.release(mk);
         return out;
     }
@@ -338,7 +370,7 @@ Tensor Engine::transformer(const Tensor& x, const std::string& p, int heads) {
         Tensor q, k, v; linQ3(n, dm_.lin(b + ".attn1.to_qkv"), h.C, q, k, v);
         AttnKV kv = quantKV(k, v, heads);
         Tensor a = attention(q, kv, heads, false, q.T);
-        lin(a, dm_.lin(b + ".attn1.to_out.0"), h.d, h.d);
+        linX(a, dm_.lin(b + ".attn1.to_out.0"), h.d, h.d);
         arena_.release(m2);
     }
     {
@@ -347,17 +379,18 @@ Tensor Engine::transformer(const Tensor& x, const std::string& p, int heads) {
         Tensor q = linQ(n, dm_.lin(b + ".attn2.to_q"));
         auto it = crossKV_.find(b); if (it == crossKV_.end()) throw std::runtime_error("no cross KV for " + b);
         Tensor a = attention(q, it->second, heads, false, q.T);
-        lin(a, dm_.lin(b + ".attn2.to_out.0"), h.d, h.d);
+        linX(a, dm_.lin(b + ".attn2.to_out.0"), h.d, h.d);
         arena_.release(m2);
     }
     {
         size_t m2 = arena_.mark();
         QuantIn n = layernormQ(h, dm_.norm(b + ".norm3"));
-        QuantIn aq = linQGegluQ(n, dm_.lin(b + ".ff.net.0.proj.ag"), dm_.lin(b + ".ff.net.0.proj.a").N, &dm_.lin(b + ".ff.net.0.proj.agi"));
-        linQ(aq, dm_.lin(b + ".ff.net.2"), h.d, h.d);
+        const int F = dm_.lin(b + ".ff.net.0.proj.a").N; const Lin& Li = dm_.lin(b + ".ff.net.0.proj.agi");
+        if (cfg_.fusedLoader && useHl(Li)) { Tensor v = gegluX(n, Li, F); Tensor hh = linX(v, dm_.lin(b + ".ff.net.2"), h.d, h.d, EPI_PLAIN, true); h.rowmax = hh.rowmax; }
+        else { QuantIn aq = linQGegluQ(n, dm_.lin(b + ".ff.net.0.proj.ag"), F, &Li); linQ(aq, dm_.lin(b + ".ff.net.2"), h.d, h.d); }
         arena_.release(m2);
     }
-    lin(h, dm_.lin(p + ".proj_out"), out.d, x.d);
+    linX(h, dm_.lin(p + ".proj_out"), out.d, x.d);
     arena_.release(mk);
     return out;
 }
@@ -410,11 +443,17 @@ Tensor Engine::textEncoder(const std::vector<int>& ids) {
         k.T = T; v.T = T;                    // only the 77 real rows are keys/values
         AttnKV kv = quantKV(k, v, 16);
         Tensor a = attention(q, kv, 16, true, T);
-        lin(a, dm_.lin(p + ".self_attn.out_proj"), x.d, x.d);
+        linX(a, dm_.lin(p + ".self_attn.out_proj"), x.d, x.d);
         arena_.release(mk); mk = arena_.mark();
         QuantIn n2 = layernormQ(x, dm_.norm(p + ".layer_norm2"));
-        Tensor f = linQ(n2, dm_.lin(p + ".mlp.fc1")); k_act(st_, f.d, f.n(), dm_.lutPhi32);
-        lin(f, dm_.lin(p + ".mlp.fc2"), x.d, x.d);
+        Tensor f;
+        if (cfg_.fusedLoader && useHl(dm_.lin(p + ".mlp.fc1"))) {
+            const Lin& L1 = dm_.lin(p + ".mlp.fc1"); f.B = 1; f.T = Tp; f.C = L1.N; f.d = (int32_t*)arena_.alloc(f.n() * 4); f.rowmax = rowmaxAlloc(Tp);
+            ASrc A; A.src = SRC_I8; A.hi = n2.hi; A.lo = n2.lo; A.ld8 = L1.Kp; A.e = n2.e;
+            AEpi E; E.epi = EPI_GELU; E.Y = f.d; E.ldy = L1.N; E.Lphi = dm_.lutPhi32; E.rowmax = f.rowmax;
+            k_gemm_hl2(st_, A, n2.Mp, Tp, L1.w, L1.Kp, L1.Np, L1.N, L1.Kp, L1.cst, E);
+            linX(f, dm_.lin(p + ".mlp.fc2"), x.d, x.d);
+        } else { f = linQ(n2, dm_.lin(p + ".mlp.fc1")); k_act(st_, f.d, f.n(), dm_.lutPhi32); lin(f, dm_.lin(p + ".mlp.fc2"), x.d, x.d); }
         arena_.release(mk);
     }
     return layernorm(x, dm_.norm("te.final_layer_norm"));

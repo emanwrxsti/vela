@@ -33,7 +33,7 @@ private:
     void* dalloc(size_t n);
 };
 
-struct Tensor { int32_t* d = nullptr; int B = 0, T = 0, C = 0; size_t n() const { return size_t(B) * T * C; } };
+struct Tensor { int32_t* d = nullptr; int B = 0, T = 0, C = 0; uint32_t* rowmax = nullptr; size_t n() const { return size_t(B) * T * C; } };   // rowmax: per-row max|x| when the producer provided it
 
 struct Arena {
     uint8_t* base = nullptr; size_t cap = 0, off = 0, peak = 0;
@@ -50,7 +50,7 @@ struct AttnKV {   // quantised key/value operands of one attention call
     int Tk = 0, Tkp = 0;
 };
 
-struct EngineConfig { int batch = 4; bool fusedAttention = true; int customGemmMaxK = 1 << 30; /* gemm_hl for Kp <= this (0 = always cuBLASLt); default: all GEMMs custom */ size_t arenaBytes = 0; size_t scoreBytes = 256u << 20; int gemmWorkspace = 32 << 20; bool graph = true; };
+struct EngineConfig { int batch = 4; bool fusedAttention = true; int customGemmMaxK = 1536; /* gemm_hl for Kp <= this (0 = always cuBLASLt); deep-K convs stay on cuBLASLt (measured faster) */ bool fusedLoader = true; /* quantise A inside the GEMM (int32 + rowmax, implicit im2col) */ size_t arenaBytes = 0; size_t scoreBytes = 256u << 20; int gemmWorkspace = 32 << 20; bool graph = true; };
 
 class Engine {
 public:
@@ -87,6 +87,10 @@ private:
     void linQ3(const QuantIn& q, const Lin& L, int Cs, Tensor& y0, Tensor& y1, Tensor& y2);   // merged GEMM, split epilogue
     QuantIn linQGegluQ(const QuantIn& q, const Lin& L, int F, const Lin* Li = nullptr);          // merged [a|g] GEMM + GEGLU + quant (Li = interleaved weights for the custom GEMM)
     bool useHl(const Lin& L) const;
+    Tensor gegluX(const QuantIn& q, const Lin& Li, int F);          // interleaved a|g GEMM with GEGLU epilogue -> int32 [rows, F] + rowmax
+    /** GEMM on an int32 input quantised on load (needs x.rowmax); falls back to lin() when unavailable. */
+    Tensor linX(const Tensor& x, const Lin& L, int32_t* out = nullptr, const int32_t* residual = nullptr, int epi = 0, bool wantRowmax = false);
+    uint32_t* rowmaxAlloc(int rows);
     Tensor conv3(const Tensor& x, int H, int W, const Lin& L, int stride, int32_t* out = nullptr, const int32_t* residual = nullptr, const u32* pmIn = nullptr);
     Tensor groupnorm(const Tensor& x, const Norm& nm);
     Tensor layernorm(const Tensor& x, const Norm& nm);

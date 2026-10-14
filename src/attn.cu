@@ -78,7 +78,7 @@ __global__ void __launch_bounds__(NTHR, (TQ == 64 ? (PASS == 2 ? 2 : 3) : 1)) at
     const int8_t* __restrict__ qhi, const int8_t* __restrict__ qlo, const int32_t* __restrict__ eq, const i64* __restrict__ qhs, const i64* __restrict__ qls,
     const int8_t* __restrict__ khi, const int8_t* __restrict__ klo, const int32_t* __restrict__ ek, const i64* __restrict__ ksum,
     const int8_t* __restrict__ vthi, const int8_t* __restrict__ vtlo, const int32_t* __restrict__ ev, const i64* __restrict__ vsum,
-    int Tq, int Tqp, int Tk, int Tkp, int causal, const i64* __restrict__ Lexp, int heads, int C, int32_t* __restrict__ gmx, i64* __restrict__ gr, int32_t* __restrict__ out) {
+    int Tq, int Tqp, int Tk, int Tkp, int causal, const i64* __restrict__ Lexp, int heads, int C, int32_t* __restrict__ gmx, i64* __restrict__ gr, int32_t* __restrict__ out, uint32_t* __restrict__ rowmax) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     Smem& S = *reinterpret_cast<Smem*>(smem_raw);
     const int g = blockIdx.y, qt = blockIdx.x, q0 = qt * TQ;
@@ -216,14 +216,21 @@ __global__ void __launch_bounds__(NTHR, (TQ == 64 ? (PASS == 2 ? 2 : 3) : 1)) at
         __syncthreads();
         const i64 ps0 = 32768LL * (S.phsh[0][row0] + S.phsh[1][row0]) + 128LL * (S.plsh[0][row0] + S.plsh[1][row0]);
         const i64 ps1 = 32768LL * (S.phsh[0][row1] + S.phsh[1][row1]) + 128LL * (S.plsh[0][row1] + S.plsh[1][row1]);
+        unsigned am0 = 0, am1 = 0;
         for (int nd = 0; nd < 4; ++nd) {
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const bool r1 = j >= 2; const int q = r1 ? qrow1 : qrow0; if (q >= Tq) continue;
                 const int d = kh * 32 + nd * 8 + t4 * 2 + (j & 1);
                 i64 O = 65536LL * o_hh[nd][j] + 256LL * o_mx[nd][j] + o_ll[nd][j] + (r1 ? ps1 : ps0) + 128LL * S.vvsum[d];
-                out[(size_t(b) * Tq + q) * C + h * 64 + d] = int32_t(rshr(O, 15 - S.vev[d]));
+                const int32_t ov = int32_t(rshr(O, 15 - S.vev[d]));
+                out[(size_t(b) * Tq + q) * C + h * 64 + d] = ov;
+                const unsigned a = unsigned(ov < 0 ? -i64(ov) : ov); if (r1) am1 = max(am1, a); else am0 = max(am0, a);
             }
+        }
+        if (rowmax) {
+            for (int o = 1; o < 4; o <<= 1) { am0 = max(am0, __shfl_xor_sync(0xffffffffu, am0, o)); am1 = max(am1, __shfl_xor_sync(0xffffffffu, am1, o)); }
+            if (t4 == 0) { if (qrow0 < Tq && am0) atomicMax(rowmax + size_t(b) * Tq + qrow0, am0); if (qrow1 < Tq && am1) atomicMax(rowmax + size_t(b) * Tq + qrow1, am1); }
         }
     }
 }
@@ -233,7 +240,7 @@ constexpr size_t SMEM0 = offsetof(Smem, lexp), SMEM1 = offsetof(Smem, vhi), SMEM
 void k_fused_attention(cudaStream_t st, const int8_t* qhi, const int8_t* qlo, const int32_t* eq, const i64* qhs, const i64* qls,
                        const int8_t* khi, const int8_t* klo, const int32_t* ek, const i64* ksum,
                        const int8_t* vthi, const int8_t* vtlo, const int32_t* ev, const i64* vsum,
-                       int B, int heads, int Tq, int Tqp, int Tk, int Tkp, bool causal, const i64* Lexp, int C, int32_t* gmx, i64* gr, int32_t* out) {
+                       int B, int heads, int Tq, int Tqp, int Tk, int Tkp, bool causal, const i64* Lexp, int C, int32_t* gmx, i64* gr, int32_t* out, uint32_t* rowmax) {
     if (Tqp % TQ || Tkp % 64) throw std::runtime_error("fused attention: Tqp/Tkp alignment");
     static bool attrSet = false;
     if (!attrSet) {
@@ -243,8 +250,8 @@ void k_fused_attention(cudaStream_t st, const int8_t* qhi, const int8_t* qlo, co
         attrSet = true;
     }
     dim3 grid(Tqp / TQ, B * heads);
-    attn_pass_k<0><<<grid, NTHR, SMEM0, st>>>(qhi, qlo, eq, qhs, qls, khi, klo, ek, ksum, vthi, vtlo, ev, vsum, Tq, Tqp, Tk, Tkp, causal, Lexp, heads, C, gmx, gr, out);
-    attn_pass_k<1><<<grid, NTHR, SMEM1, st>>>(qhi, qlo, eq, qhs, qls, khi, klo, ek, ksum, vthi, vtlo, ev, vsum, Tq, Tqp, Tk, Tkp, causal, Lexp, heads, C, gmx, gr, out);
-    attn_pass_k<2><<<grid, NTHR, SMEM2, st>>>(qhi, qlo, eq, qhs, qls, khi, klo, ek, ksum, vthi, vtlo, ev, vsum, Tq, Tqp, Tk, Tkp, causal, Lexp, heads, C, gmx, gr, out);
+    attn_pass_k<0><<<grid, NTHR, SMEM0, st>>>(qhi, qlo, eq, qhs, qls, khi, klo, ek, ksum, vthi, vtlo, ev, vsum, Tq, Tqp, Tk, Tkp, causal, Lexp, heads, C, gmx, gr, out, rowmax);
+    attn_pass_k<1><<<grid, NTHR, SMEM1, st>>>(qhi, qlo, eq, qhs, qls, khi, klo, ek, ksum, vthi, vtlo, ev, vsum, Tq, Tqp, Tk, Tkp, causal, Lexp, heads, C, gmx, gr, out, rowmax);
+    attn_pass_k<2><<<grid, NTHR, SMEM2, st>>>(qhi, qlo, eq, qhs, qls, khi, klo, ek, ksum, vthi, vtlo, ev, vsum, Tq, Tqp, Tk, Tkp, causal, Lexp, heads, C, gmx, gr, out, rowmax);
 }
 }  // namespace meow

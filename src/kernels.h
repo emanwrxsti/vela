@@ -68,5 +68,5 @@ namespace meow {
 void k_fused_attention(cudaStream_t st, const int8_t* qhi, const int8_t* qlo, const int32_t* eq, const i64* qhs, const i64* qls,
                        const int8_t* khi, const int8_t* klo, const int32_t* ek, const i64* ksum,
                        const int8_t* vthi, const int8_t* vtlo, const int32_t* ev, const i64* vsum,
-                       int B, int heads, int Tq, int Tqp, int Tk, int Tkp, bool causal, const i64* Lexp, int C, int32_t* gmx, i64* gr, int32_t* out);
+                       int B, int heads, int Tq, int Tqp, int Tk, int Tkp, bool causal, const i64* Lexp, int C, int32_t* gmx, i64* gr, int32_t* out, uint32_t* rowmax = nullptr);   // rowmax[b*Tq+q] = atomicMax |out| (optional)
 }

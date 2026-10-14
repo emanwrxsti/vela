@@ -1,4 +1,5 @@
 #include "engine.h"
+#include "gemm_hl.h"
 #include "common.h"
 #include <cstring>
 #include <algorithm>
@@ -22,7 +23,7 @@ void DevModel::load(int dev, const Poisd& model) {
         std::string base = name.substr(0, name.size() - 2);
         if (base == "te.tok") continue;
         if (!model.has(base + ".m")) continue;
-        Lin L; L.N = int(t.dims[0]); L.K = int(t.dims[1]); L.Np = int(align_up(L.N, 32)); L.Kp = int(align_up(L.K, 16)); L.conv3 = is3x3(base);
+        Lin L; L.N = int(t.dims[0]); L.K = int(t.dims[1]); L.Np = int(align_up(L.N, 64)); L.Kp = int(align_up(L.K, 16)); L.conv3 = is3x3(base);
         const int8_t* w = model.i8(name);
         hbuf.assign(size_t(L.Np) * L.Kp, 0);
         std::vector<i64> wsum(L.Np, 0), m(L.Np, 1), s(L.Np, 0), b(L.Np, 0);
@@ -64,20 +65,28 @@ void DevModel::load(int dev, const Poisd& model) {
     for (int i = 0; i < 3; ++i) for (int j = 0; j < 2; ++j) blocks.push_back("unet.down_blocks." + std::to_string(i) + ".attentions." + std::to_string(j));
     blocks.push_back("unet.mid_block.attentions.0");
     for (int i = 1; i < 4; ++i) for (int j = 0; j < 3; ++j) blocks.push_back("unet.up_blocks." + std::to_string(i) + ".attentions." + std::to_string(j));
-    for (auto& bl : blocks) { std::string b = bl + ".transformer_blocks.0"; mergeLins(b + ".attn1.to_qkv", {b + ".attn1.to_q", b + ".attn1.to_k", b + ".attn1.to_v"}); mergeLins(b + ".ff.net.0.proj.ag", {b + ".ff.net.0.proj.a", b + ".ff.net.0.proj.g"}); }
+    for (auto& bl : blocks) { std::string b = bl + ".transformer_blocks.0"; mergeLins(b + ".attn1.to_qkv", {b + ".attn1.to_q", b + ".attn1.to_k", b + ".attn1.to_v"}); mergeLins(b + ".ff.net.0.proj.ag", {b + ".ff.net.0.proj.a", b + ".ff.net.0.proj.g"}); mergeLins(b + ".ff.net.0.proj.agi", {b + ".ff.net.0.proj.a", b + ".ff.net.0.proj.g"}, true); }
     for (int l = 0; l < 23; ++l) { std::string p = "te.layers." + std::to_string(l); mergeLins(p + ".self_attn.qkv", {p + ".self_attn.q_proj", p + ".self_attn.k_proj", p + ".self_attn.v_proj"}); }
 }
-void DevModel::mergeLins(const std::string& name, const std::vector<std::string>& parts) {
+void DevModel::mergeLins(const std::string& name, const std::vector<std::string>& parts, bool interleave) {
     std::vector<const Lin*> ls; int N = 0, K = -1;
     for (auto& pn : parts) { auto it = lins_.find(pn); if (it == lins_.end()) return; ls.push_back(&it->second); N += it->second.N; if (K < 0) K = it->second.K; else if (K != it->second.K) throw std::runtime_error("mergeLins: K mismatch"); }
-    Lin L; L.N = N; L.K = K; L.Np = int(align_up(N, 32)); L.Kp = ls[0]->Kp; L.conv3 = false;
+    Lin L; L.N = N; L.K = K; L.Np = int(align_up(N, 64)); L.Kp = ls[0]->Kp; L.conv3 = false;
     L.w = (int8_t*)dalloc(size_t(L.Np) * L.Kp); CUDA_CHECK(cudaMemset(L.w, 0, size_t(L.Np) * L.Kp));
     L.wsum = (i64*)dalloc(size_t(L.Np) * 8); L.m = (i64*)dalloc(size_t(L.Np) * 8); L.s = (i64*)dalloc(size_t(L.Np) * 8); L.b = (i64*)dalloc(size_t(L.Np) * 8);
     std::vector<i64> ones(L.Np, 1), zeros(L.Np, 0);
     CUDA_CHECK(cudaMemcpy(L.m, ones.data(), size_t(L.Np) * 8, cudaMemcpyHostToDevice)); CUDA_CHECK(cudaMemcpy(L.s, zeros.data(), size_t(L.Np) * 8, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(L.b, zeros.data(), size_t(L.Np) * 8, cudaMemcpyHostToDevice)); CUDA_CHECK(cudaMemcpy(L.wsum, zeros.data(), size_t(L.Np) * 8, cudaMemcpyHostToDevice));
     int off = 0;
-    for (const Lin* p : ls) {
+    if (interleave) {
+        const int P = int(ls.size()); const int Ni = ls[0]->N;
+        for (int i = 0; i < P; ++i) {
+            const Lin* p = ls[i]; if (p->N != Ni) throw std::runtime_error("mergeLins interleave: N mismatch");
+            CUDA_CHECK(cudaMemcpy2D(L.w + size_t(i) * L.Kp, size_t(P) * L.Kp, p->w, L.Kp, L.Kp, Ni, cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy2D(L.wsum + i, size_t(P) * 8, p->wsum, 8, 8, Ni, cudaMemcpyDeviceToDevice)); CUDA_CHECK(cudaMemcpy2D(L.m + i, size_t(P) * 8, p->m, 8, 8, Ni, cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy2D(L.s + i, size_t(P) * 8, p->s, 8, 8, Ni, cudaMemcpyDeviceToDevice)); CUDA_CHECK(cudaMemcpy2D(L.b + i, size_t(P) * 8, p->b, 8, 8, Ni, cudaMemcpyDeviceToDevice));
+        }
+    } else for (const Lin* p : ls) {
         CUDA_CHECK(cudaMemcpy(L.w + size_t(off) * L.Kp, p->w, size_t(p->N) * L.Kp, cudaMemcpyDeviceToDevice));
         CUDA_CHECK(cudaMemcpy(L.wsum + off, p->wsum, size_t(p->N) * 8, cudaMemcpyDeviceToDevice)); CUDA_CHECK(cudaMemcpy(L.m + off, p->m, size_t(p->N) * 8, cudaMemcpyDeviceToDevice));
         CUDA_CHECK(cudaMemcpy(L.s + off, p->s, size_t(p->N) * 8, cudaMemcpyDeviceToDevice)); CUDA_CHECK(cudaMemcpy(L.b + off, p->b, size_t(p->N) * 8, cudaMemcpyDeviceToDevice));
@@ -128,7 +137,7 @@ Engine::~Engine() {
 
 // ------------------------------------------------------------------ ops
 QuantIn Engine::qalloc(int B, int T, int K) {
-    QuantIn q; q.B = B; q.T = T; q.K = K; q.Kp = int(align_up(K, 16)); q.Mp = int(align_up(B * T, 32));
+    QuantIn q; q.B = B; q.T = T; q.K = K; q.Kp = int(align_up(K, 16)); q.Mp = int(align_up(B * T, 64));
     q.hi = (int8_t*)arena_.alloc(size_t(2) * q.Mp * q.Kp); q.lo = q.hi + size_t(q.Mp) * q.Kp;      // stacked [hi; lo] -> one GEMM
     q.e = (int32_t*)arena_.alloc(size_t(q.Mp) * 4);
     return q;
@@ -137,6 +146,7 @@ Tensor Engine::linQ(const QuantIn& q, const Lin& L, int32_t* out, const int32_t*
     if (q.K != L.K || q.Kp != L.Kp) throw std::runtime_error("linQ: K mismatch " + std::to_string(q.K) + " vs " + std::to_string(L.K));
     int rows = q.rows(), Mp = q.Mp;
     Tensor y; y.B = q.B; y.T = q.T; y.C = L.N; y.d = out ? out : (int32_t*)arena_.alloc(y.n() * 4);
+    if (useHl(L)) { k_gemm_hl(st_, q.hi, q.lo, L.Kp, Mp, rows, L.w, L.Kp, L.Np, L.N, L.Kp, L.cst, q.e, y.d, L.N, residual); return y; }
     size_t mk = arena_.mark();
     int32_t* Chi = (int32_t*)arena_.alloc(size_t(2) * Mp * L.Np * 4); int32_t* Clo = Chi + size_t(Mp) * L.Np;
     gemm_.run(st_, q.hi, L.Kp, 0, L.w, L.Kp, 0, Chi, L.Np, 0, 2 * Mp, L.Np, L.Kp);
@@ -144,6 +154,7 @@ Tensor Engine::linQ(const QuantIn& q, const Lin& L, int32_t* out, const int32_t*
     arena_.release(mk);
     return y;
 }
+bool Engine::useHl(const Lin& L) const { return cfg_.customGemmMaxK > 0 && L.Kp <= cfg_.customGemmMaxK && gemm_hl_supported(64, L.Np, L.Kp); }
 Tensor Engine::lin(const Tensor& x, const Lin& L, int32_t* out, const int32_t* residual) {
     if (x.C != L.K) throw std::runtime_error("lin: K mismatch " + std::to_string(x.C) + " vs " + std::to_string(L.K));
     size_t mk = arena_.mark();
@@ -159,17 +170,25 @@ void Engine::linQ3(const QuantIn& q, const Lin& L, int Cs, Tensor& y0, Tensor& y
     if (q.K != L.K || L.N != 3 * Cs) throw std::runtime_error("linQ3: shape mismatch");
     int rows = q.rows(), Mp = q.Mp;
     y0 = talloc(q.B, q.T, Cs); y1 = talloc(q.B, q.T, Cs); y2 = talloc(q.B, q.T, Cs);
+    if (useHl(L) && Cs % 8 == 0) { k_gemm_hl(st_, q.hi, q.lo, L.Kp, Mp, rows, L.w, L.Kp, L.Np, L.N, L.Kp, L.cst, q.e, y0.d, Cs, nullptr, EPI_SPLIT3, Cs, y1.d, y2.d); return; }
     size_t mk = arena_.mark();
     int32_t* Chi = (int32_t*)arena_.alloc(size_t(2) * Mp * L.Np * 4); int32_t* Clo = Chi + size_t(Mp) * L.Np;
     gemm_.run(st_, q.hi, L.Kp, 0, L.w, L.Kp, 0, Chi, L.Np, 0, 2 * Mp, L.Np, L.Kp);
     k_epilogue_split(st_, Chi, Clo, rows, L.N, L.Np, L.cst, q.e, Cs, y0.d, y1.d, y2.d);
     arena_.release(mk);
 }
-QuantIn Engine::linQGegluQ(const QuantIn& q, const Lin& L, int F) {
+QuantIn Engine::linQGegluQ(const QuantIn& q, const Lin& L, int F, const Lin* Li) {
     if (q.K != L.K || L.N != 2 * F) throw std::runtime_error("linQGegluQ: shape mismatch");
     int rows = q.rows(), Mp = q.Mp;
     QuantIn out = qalloc(q.B, q.T, F);
     size_t mk = arena_.mark();
+    if (Li && useHl(*Li)) {                       // interleaved a|g weights: GEGLU in the GEMM epilogue, then row quantisation
+        int32_t* v = (int32_t*)arena_.alloc(size_t(Mp) * F * 4);
+        k_gemm_hl(st_, q.hi, q.lo, Li->Kp, Mp, rows, Li->w, Li->Kp, Li->Np, Li->N, Li->Kp, Li->cst, q.e, v, F, nullptr, EPI_GEGLU, 0, nullptr, nullptr, dm_.lutPhi32);
+        k_quant_rows(st_, v, rows, F, F, out.hi, out.lo, out.e, out.Kp);
+        arena_.release(mk);
+        return out;
+    }
     int32_t* Chi = (int32_t*)arena_.alloc(size_t(2) * Mp * L.Np * 4); int32_t* Clo = Chi + size_t(Mp) * L.Np;
     gemm_.run(st_, q.hi, L.Kp, 0, L.w, L.Kp, 0, Chi, L.Np, 0, 2 * Mp, L.Np, L.Kp);
     k_epilogue_geglu_q(st_, Chi, Clo, rows, F, L.Np, L.cst, q.e, dm_.lutPhi32, out.hi, out.lo, out.e, out.Kp);
@@ -207,7 +226,7 @@ Tensor Engine::groupnormSilu(const Tensor& x, const Norm& nm, u32*& pm) {
 }
 Tensor Engine::conv3(const Tensor& x, int H, int W, const Lin& L, int stride, int32_t* out, const int32_t* residual, const u32* pmIn) {
     if (!L.conv3 || x.C * 9 != L.K) throw std::runtime_error("conv3: shape mismatch");
-    int Ho = (H - 1) / stride + 1, Wo = (W - 1) / stride + 1; int rows = x.B * Ho * Wo, Mp = int(align_up(rows, 32));
+    int Ho = (H - 1) / stride + 1, Wo = (W - 1) / stride + 1; int rows = x.B * Ho * Wo, Mp = int(align_up(rows, 64));
     Tensor y; y.B = x.B; y.T = Ho * Wo; y.C = L.N; y.d = out ? out : (int32_t*)arena_.alloc(y.n() * 4);
     size_t mk = arena_.mark();
     u32* pm = const_cast<u32*>(pmIn);
@@ -334,7 +353,7 @@ Tensor Engine::transformer(const Tensor& x, const std::string& p, int heads) {
     {
         size_t m2 = arena_.mark();
         QuantIn n = layernormQ(h, dm_.norm(b + ".norm3"));
-        QuantIn aq = linQGegluQ(n, dm_.lin(b + ".ff.net.0.proj.ag"), dm_.lin(b + ".ff.net.0.proj.a").N);
+        QuantIn aq = linQGegluQ(n, dm_.lin(b + ".ff.net.0.proj.ag"), dm_.lin(b + ".ff.net.0.proj.a").N, &dm_.lin(b + ".ff.net.0.proj.agi"));
         linQ(aq, dm_.lin(b + ".ff.net.2"), h.d, h.d);
         arena_.release(m2);
     }

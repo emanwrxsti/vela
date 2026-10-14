@@ -17,7 +17,7 @@ find_package(OpenSSL)
 
 add_executable(supr-meow-vela
   src/main.cpp src/poisd.cpp src/stratum.cpp src/httpd.cpp src/device.cpp
-  src/kernels.cu src/attn.cu src/gemm.cu src/engine.cu)
+  src/kernels.cu src/attn.cu src/gemm.cu src/gemm_hl.cu src/engine.cu)
 target_include_directories(supr-meow-vela PRIVATE src vendor ${CUDAToolkit_INCLUDE_DIRS})
 target_compile_options(supr-meow-vela PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra -Wno-unused-parameter>

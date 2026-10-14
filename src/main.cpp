@@ -32,7 +32,7 @@ static void logln(const std::string& s) {
 struct Opts {
     std::string model = "sd-turbo-int.poisd", url, wallet, password = "x", host = "0.0.0.0";
     std::vector<int> devices; int batch = 4; int lanes = 2; bool tls = false; bool graph = true;
-    bool fusedAttn = true; bool testAttn = false; bool check = false, bench = false, verifyServer = false; int benchIters = 20; int port = 9010; size_t memMB = 0; size_t scoreMB = 256;
+    bool fusedAttn = true; bool testAttn = false; int gemmMaxK = 1 << 30; bool check = false, bench = false, verifyServer = false; int benchIters = 20; int port = 9010; size_t memMB = 0; size_t scoreMB = 256;
     std::string seedHex, headerHex, tokensStr, x0Out; double suggestDiff = 0; int threads = 4;
 };
 static void usage() {
@@ -62,7 +62,7 @@ static Opts parse(int argc, char** argv) {
         if (a == "-o" || a == "--url") o.url = next(); else if (a == "-u" || a == "--user") o.wallet = next(); else if (a == "-p" || a == "--pass") o.password = next();
         else if (a == "--tls") o.tls = true; else if (a == "--model") o.model = next(); else if (a == "--devices") o.devices = parseInts(next());
         else if (a == "--batch") o.batch = std::stoi(next()); else if (a == "--lanes") o.lanes = std::stoi(next()); else if (a == "--mem") o.memMB = std::stoul(next());
-        else if (a == "--score-mb") o.scoreMB = std::stoul(next()); else if (a == "--suggest-diff") o.suggestDiff = std::stod(next()); else if (a == "--no-graph") o.graph = false; else if (a == "--attn-cublas") o.fusedAttn = false; else if (a == "--test-attn") o.testAttn = true;
+        else if (a == "--score-mb") o.scoreMB = std::stoul(next()); else if (a == "--suggest-diff") o.suggestDiff = std::stod(next()); else if (a == "--no-graph") o.graph = false; else if (a == "--attn-cublas") o.fusedAttn = false; else if (a == "--test-attn") o.testAttn = true; else if (a == "--gemm-maxk") o.gemmMaxK = std::stoi(next());
         else if (a == "--check") o.check = true; else if (a == "--bench") { o.bench = true; if (i + 1 < argc && argv[i + 1][0] != '-') o.benchIters = std::stoi(argv[++i]); }
         else if (a == "--seed") o.seedHex = next(); else if (a == "--header") o.headerHex = next(); else if (a == "--x0-out") o.x0Out = next(); else if (a == "--tokens") o.tokensStr = next();
         else if (a == "--verify-server") o.verifyServer = true; else if (a == "--port") o.port = std::stoi(next()); else if (a == "--host") o.host = next(); else if (a == "--threads") o.threads = std::stoi(next());
@@ -79,7 +79,7 @@ static std::array<uint8_t, 32> poiOut(const std::array<uint8_t, 32>& seed, const
 // ------------------------------------------------------------------ single inference / check
 static int runSingle(const Opts& o, const Poisd& model, const std::vector<int>& devs, std::array<uint8_t, 32> seed, const std::vector<int>& tokens, const char* expectHex) {
     DevModel dm; dm.load(devs[0], model);
-    EngineConfig cfg; cfg.batch = o.batch; cfg.graph = o.graph; cfg.fusedAttention = o.fusedAttn; cfg.scoreBytes = o.scoreMB << 20; if (o.memMB) cfg.arenaBytes = o.memMB << 20;
+    EngineConfig cfg; cfg.batch = o.batch; cfg.graph = o.graph; cfg.fusedAttention = o.fusedAttn; cfg.customGemmMaxK = o.gemmMaxK; cfg.scoreBytes = o.scoreMB << 20; if (o.memMB) cfg.arenaBytes = o.memMB << 20;
     Engine eng(dm, cfg);
     auto t0 = std::chrono::steady_clock::now();
     eng.setPrompt(tokens);
@@ -115,7 +115,7 @@ static int runBench(const Opts& o, const Poisd& model, const std::vector<int>& d
         try {
             DevModel dm; dm.load(dev, model);
             size_t freeB = 0, totB = 0; cudaMemGetInfo(&freeB, &totB);
-            EngineConfig cfg; cfg.batch = o.batch; cfg.graph = o.graph; cfg.fusedAttention = o.fusedAttn; cfg.scoreBytes = o.scoreMB << 20;
+            EngineConfig cfg; cfg.batch = o.batch; cfg.graph = o.graph; cfg.fusedAttention = o.fusedAttn; cfg.customGemmMaxK = o.gemmMaxK; cfg.scoreBytes = o.scoreMB << 20;
             cfg.arenaBytes = o.memMB ? (o.memMB << 20) : (freeB - (768u << 20)) / o.lanes;
             std::vector<std::unique_ptr<Engine>> lanes; for (int l = 0; l < o.lanes; ++l) { lanes.emplace_back(new Engine(dm, cfg)); lanes.back()->setPrompt(tokens); }
             std::vector<std::thread> lt; std::atomic<uint64_t> devTotal{0};
@@ -154,7 +154,7 @@ static int runVerifyServer(const Opts& o, const Poisd& model, const std::vector<
     std::vector<std::unique_ptr<Slot>> slots;
     for (int dev : devs) {
         auto s = std::make_unique<Slot>(); s->dm = std::make_unique<DevModel>(); s->dm->load(dev, model);
-        EngineConfig cfg; cfg.batch = 1; cfg.graph = o.graph; cfg.fusedAttention = o.fusedAttn; cfg.scoreBytes = o.scoreMB << 20; if (o.memMB) cfg.arenaBytes = o.memMB << 20;
+        EngineConfig cfg; cfg.batch = 1; cfg.graph = o.graph; cfg.fusedAttention = o.fusedAttn; cfg.customGemmMaxK = o.gemmMaxK; cfg.scoreBytes = o.scoreMB << 20; if (o.memMB) cfg.arenaBytes = o.memMB << 20;
         s->eng = std::make_unique<Engine>(*s->dm, cfg); s->eng->setPrompt({320, 736, 3240});
         std::vector<uint8_t> seed(32, 1), x0(32768); s->eng->run(seed.data(), x0.data());
         slots.push_back(std::move(s));
@@ -268,7 +268,7 @@ static int runMiner(const Opts& o, const Poisd& model, const std::vector<int>& d
     for (int dev : devs) {
         auto dm = std::make_unique<DevModel>(); dm->load(dev, model);
         size_t freeB = 0, totB = 0; cudaMemGetInfo(&freeB, &totB);
-        EngineConfig cfg; cfg.batch = o.batch; cfg.graph = o.graph; cfg.fusedAttention = o.fusedAttn; cfg.scoreBytes = o.scoreMB << 20;
+        EngineConfig cfg; cfg.batch = o.batch; cfg.graph = o.graph; cfg.fusedAttention = o.fusedAttn; cfg.customGemmMaxK = o.gemmMaxK; cfg.scoreBytes = o.scoreMB << 20;
         cfg.arenaBytes = o.memMB ? (o.memMB << 20) : (freeB > (1024u << 20) ? (freeB - (768u << 20)) / o.lanes : freeB / 2 / o.lanes);
         logln("GPU " + std::to_string(dev) + ": model " + std::to_string(dm->bytes >> 20) + " MiB on device, " + std::to_string(freeB >> 20) + " MiB free, arena " + std::to_string(cfg.arenaBytes >> 20) + " MiB x " + std::to_string(o.lanes) + " lanes, batch " + std::to_string(o.batch));
         for (int l = 0; l < o.lanes; ++l) {

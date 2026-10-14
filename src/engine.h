@@ -18,7 +18,7 @@ public:
     void load(int device, const Poisd& model);
     const Lin& lin(const std::string& n) const;
     /** Row-concatenation of linears sharing K (N = ΣN_i), e.g. to_q|to_k|to_v, ff a|g; built once at load. */
-    void mergeLins(const std::string& name, const std::vector<std::string>& parts);
+    void mergeLins(const std::string& name, const std::vector<std::string>& parts, bool interleave = false);   // interleave: rows of the parts alternate (a0,g0,a1,g1,…)
     const Norm& norm(const std::string& n) const;
     bool hasLin(const std::string& n) const { return lins_.count(n) != 0; }
     int32_t *lutSigmoid32 = nullptr, *lutPhi32 = nullptr;
@@ -50,7 +50,7 @@ struct AttnKV {   // quantised key/value operands of one attention call
     int Tk = 0, Tkp = 0;
 };
 
-struct EngineConfig { int batch = 4; bool fusedAttention = true; size_t arenaBytes = 0; size_t scoreBytes = 256u << 20; int gemmWorkspace = 32 << 20; bool graph = true; };
+struct EngineConfig { int batch = 4; bool fusedAttention = true; int customGemmMaxK = 1 << 30; /* gemm_hl for Kp <= this (0 = always cuBLASLt); default: all GEMMs custom */ size_t arenaBytes = 0; size_t scoreBytes = 256u << 20; int gemmWorkspace = 32 << 20; bool graph = true; };
 
 class Engine {
 public:
@@ -85,7 +85,8 @@ private:
     QuantIn groupnormQ(const Tensor& x, const Norm& nm);
     Tensor groupnormSilu(const Tensor& x, const Norm& nm, u32*& pm);   // GN + SiLU + pixel max (for conv3)
     void linQ3(const QuantIn& q, const Lin& L, int Cs, Tensor& y0, Tensor& y1, Tensor& y2);   // merged GEMM, split epilogue
-    QuantIn linQGegluQ(const QuantIn& q, const Lin& L, int F);                                 // merged [a|g] GEMM + GEGLU + quant
+    QuantIn linQGegluQ(const QuantIn& q, const Lin& L, int F, const Lin* Li = nullptr);          // merged [a|g] GEMM + GEGLU + quant (Li = interleaved weights for the custom GEMM)
+    bool useHl(const Lin& L) const;
     Tensor conv3(const Tensor& x, int H, int W, const Lin& L, int stride, int32_t* out = nullptr, const int32_t* residual = nullptr, const u32* pmIn = nullptr);
     Tensor groupnorm(const Tensor& x, const Norm& nm);
     Tensor layernorm(const Tensor& x, const Norm& nm);

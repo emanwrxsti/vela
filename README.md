@@ -1,0 +1,27 @@
+# supr-meow-vela
+
+GPU miner for **Vela** (Proof-of-Inference v2, `sd-turbo-int` W8A16) and the pool-side share verifier for vela.suprnova.cc.
+Pure C++/CUDA: no Python, no torch. Bit-exact against `contrib/poi-sd/sdint.py` (the consensus reference) — every share
+is a real inference, verified by the pool with the same engine in `--verify-server` mode.
+
+* int8 tensor-core GEMMs through cuBLASLt (16-bit activations as a hi/lo int8 split with exact int64 reconstruction)
+* fused exact attention (`mma.sync` int8, 3-pass softmax, never materialises the score matrix)
+* exact integer GroupNorm / LayerNorm / LUT non-linearities, ChaCha20 noise on the GPU, CUDA Graphs, 2 lanes per GPU
+* Ampere (sm_80, e.g. CMP 170HX / A100 / 30xx), Ada (sm_89) and Blackwell consumer (sm_120, RTX 50xx) in one fatbin
+
+## Usage
+```
+./supr-meow-vela -o vela.suprnova.cc:7601 -u vela1…yourAddress.worker --model sd-turbo-int.poisd [--batch 8 --lanes 2] [--devices 0,1] [--tls]
+./supr-meow-vela --check                  # spec test vector (sha256(x0) = bef682cc…)
+./supr-meow-vela --bench 20 --batch 8     # throughput
+./supr-meow-vela --verify-server --port 9010 --mem 1024 --batch 1   # pool verifier (HTTP POST /verify, GET /health)
+```
+Measured: RTX 5090 ≈ 70–75 inferences/s (batch 8 × 2 lanes, 575 W); CMP 170HX ≈ 15 inf/s. One share at difficulty 2048 ≈ 28 s on a 5090.
+
+## Build
+CUDA 12.8+ (13.3 used for releases), CMake ≥ 3.24, gcc 13. `cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j`.
+Release tarballs ship `lib/libcudart.so.13` and `lib/libcublasLt.so.13` next to the binary (RPATH `$ORIGIN/lib`); the NVIDIA driver must be ≥ R580 (CUDA 13).
+
+## Protocol
+Named-params JSON-RPC stratum, see `VELA-STRATUM-PROTOCOL.md` in the pool repo (`mining.subscribe` / `mining.authorize` /
+`mining.notify` with `prompt_tokens` / `mining.submit` with `x0_hex` + `hashpoi_hex`; difficulty = expected inferences per share).

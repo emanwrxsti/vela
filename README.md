@@ -9,6 +9,9 @@ is a real inference, verified by the pool with the same engine in `--verify-serv
 * exact integer GroupNorm / LayerNorm / LUT non-linearities, ChaCha20 noise on the GPU, CUDA Graphs, 2 lanes per GPU
 * Ampere (sm_80, e.g. CMP 170HX / A100 / 30xx), Ada (sm_89) and Blackwell consumer (sm_120, RTX 50xx) in one fatbin
 
+## Download
+https://vela.suprnova.cc/dl/ — `supr-meow-vela-0.1.0.tar.gz` (Linux x86-64 + bundled CUDA 13.3 runtime), `supr-meow-vela-hiveos.tar.gz`, `sd-turbo-int.poisd`, `SHA256SUMS`.
+
 ## Usage
 ```
 ./supr-meow-vela -o vela.suprnova.cc:7601 -u vela1…yourAddress.worker --model sd-turbo-int.poisd [--batch 8 --lanes 2] [--devices 0,1] [--tls]

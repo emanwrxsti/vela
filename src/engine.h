@@ -9,7 +9,7 @@
 #include <map>
 
 namespace meow {
-struct Lin { int N = 0, K = 0, Np = 0, Kp = 0; int8_t* w = nullptr; i64 *wsum = nullptr, *m = nullptr, *s = nullptr, *b = nullptr; bool conv3 = false; };
+struct Lin { int N = 0, K = 0, Np = 0, Kp = 0; int8_t* w = nullptr; i64 *wsum = nullptr, *m = nullptr, *s = nullptr, *b = nullptr; int4* cst = nullptr; bool conv3 = false; };   // cst[n] = {m, s, b, wsum} packed
 struct Norm { i64 *g = nullptr, *beta = nullptr; i64 den = 0; int C = 0; };
 
 /** Weights of one GPU, shared by all lanes on it. */

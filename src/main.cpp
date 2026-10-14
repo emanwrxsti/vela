@@ -6,6 +6,7 @@
 #include "stratum.h"
 #include "httpd.h"
 #include "device.h"
+#include <cuda_profiler_api.h>
 #include <nlohmann/json.hpp>
 #include <atomic>
 #include <chrono>
@@ -120,6 +121,7 @@ static int runBench(const Opts& o, const Poisd& model, const std::vector<int>& d
             std::vector<std::thread> lt; std::atomic<uint64_t> devTotal{0};
             // warm-up (graph capture + cuBLASLt autotune) is excluded from the timed window
             { std::vector<uint8_t> seeds(size_t(o.batch) * 32, 7), x0(size_t(o.batch) * 32768); for (auto& e : lanes) { e->run(seeds.data(), x0.data()); e->run(seeds.data(), x0.data()); } }
+            cudaProfilerStart();                       // nsys --capture-range=cudaProfilerApi: profile only the steady state
             auto td = std::chrono::steady_clock::now();
             for (int l = 0; l < o.lanes; ++l) lt.emplace_back([&, l] {
                 std::mt19937_64 rng(dev * 100 + l); std::vector<uint8_t> seeds(size_t(o.batch) * 32), x0(size_t(o.batch) * 32768);
@@ -131,6 +133,7 @@ static int runBench(const Opts& o, const Poisd& model, const std::vector<int>& d
                 }
             });
             for (auto& t : lt) t.join();
+            cudaProfilerStop();
             double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - td).count();
             std::lock_guard<std::mutex> l(mu);
             logln("GPU " + std::to_string(dev) + ": " + std::to_string(devTotal.load()) + " inferences in " + std::to_string(s) + " s = " + std::to_string(devTotal / s) + " inf/s (batch " + std::to_string(o.batch) + " x " + std::to_string(o.lanes) + " lanes, last step " + std::to_string(lanes[0]->lastMs) + " ms, arena peak " + std::to_string(lanes[0]->arenaPeak() >> 20) + " MiB)");

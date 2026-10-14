@@ -52,15 +52,16 @@ __global__ void quant_rows_k(const int32_t* __restrict__ X, int M, int K, int ld
     }
 }
 
-__global__ void epilogue_k(const int32_t* __restrict__ Chi, const int32_t* __restrict__ Clo, int M, int N, int ldc,
-                           const i64* __restrict__ wsum, const i64* __restrict__ m, const i64* __restrict__ s, const i64* __restrict__ b,
+__device__ __forceinline__ int epi1(const int32_t* __restrict__ Chi, const int32_t* __restrict__ Clo, size_t ci, const int4 c, int er) {
+    i64 acc = 256LL * Chi[ci] + Clo[ci] + 128LL * c.w;
+    return int(sat32(rshr(acc * c.x, c.y - er) + c.z));
+}
+__global__ void epilogue_k(const int32_t* __restrict__ Chi, const int32_t* __restrict__ Clo, int M, int N, int ldc, const int4* __restrict__ cst,
                            const int32_t* __restrict__ e, int32_t* __restrict__ Y, int ldy, const int32_t* R) {
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= size_t(M) * N) return;
     int r = int(i / N), n = int(i % N);
-    size_t ci = size_t(r) * ldc + n;
-    i64 acc = 256LL * Chi[ci] + Clo[ci] + 128LL * wsum[n];
-    i64 y = sat32(rshr(acc * m[n], s[n] - e[r]) + b[n]);
+    i64 y = epi1(Chi, Clo, size_t(r) * ldc + n, cst[n], e[r]);
     if (R) y = sat32(y + R[size_t(r) * ldy + n]);
     Y[size_t(r) * ldy + n] = int32_t(y);
 }
@@ -94,15 +95,14 @@ __global__ void im2col3_k(const int32_t* __restrict__ X, const u32* __restrict__
     __syncthreads();
     int ee = she; int K = 9 * C;
     int8_t* h = hi + size_t(r) * Kp; int8_t* l = lo + size_t(r) * Kp;
-    for (int k = threadIdx.x; k < Kp; k += blockDim.x) {
-        i64 q = 0;
-        if (k < K) {
-            int tap = k / C, c = k - tap * C, ky = tap / 3, kx = tap - ky * 3;
-            int iy = iy0 + ky, ix = ix0 + kx;
-            if (iy >= 0 && iy < H && ix >= 0 && ix < W) q = quant16(X[((size_t(b) * H + iy) * W + ix) * C + c], ee);
-        }
-        int8_t a, bb; split16(q, a, bb); h[k] = a; l[k] = bb;
+    for (int tap = 0; tap < 9; ++tap) {
+        int ky = tap / 3, kx = tap - ky * 3, iy = iy0 + ky, ix = ix0 + kx;
+        bool in = iy >= 0 && iy < H && ix >= 0 && ix < W;
+        const int32_t* xp = in ? X + ((size_t(b) * H + iy) * W + ix) * C : nullptr;
+        int8_t* ht = h + tap * C; int8_t* lt = l + tap * C;
+        for (int c = threadIdx.x; c < C; c += blockDim.x) { i64 q = in ? quant16(xp[c], ee) : 0; int8_t a, bb; split16(q, a, bb); ht[c] = a; lt[c] = bb; }
     }
+    for (int k = K + threadIdx.x; k < Kp; k += blockDim.x) { h[k] = 0; l[k] = -128; }
 }
 
 // ---------------------------------------------------------------- GroupNorm (NHWC, stats via atomics)
@@ -289,13 +289,16 @@ __global__ void lnorm_qw_k(const int32_t* __restrict__ X, int M, int C, const i6
 template <int R>
 __global__ void gn_apply_roww_k(const int32_t* __restrict__ X, size_t M, int T, int C, int groups, const GnStat* __restrict__ gs, const i64* __restrict__ g, const i64* __restrict__ beta, const i64* __restrict__ Lsig,
                                 int32_t* __restrict__ Y, u32* __restrict__ pm, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, int Kp) {
-    const int lane = threadIdx.x & 31; const size_t row = size_t(blockIdx.x) * 8 + (threadIdx.x >> 5);
-    if (row >= M) return;
+    __shared__ GnStat sgs[8][32];
+    const int lane = threadIdx.x & 31; const int wrow = threadIdx.x >> 5; const size_t row = size_t(blockIdx.x) * 8 + wrow;
     int b = int(row / T); int cg = C / groups;
+    if (row < M) sgs[wrow][lane] = gs[b * groups + lane];     // 32 groups, one per lane
+    __syncwarp();
+    if (row >= M) return;
     const int32_t* x = X + row * C;
     int v[R]; int cnt = 0; u32 m = 0;
     for (int c = lane; c < C; c += 32, ++cnt) {
-        GnStat st = gs[b * groups + c / cg];
+        const GnStat& st = sgs[wrow][c / cg];
         i64 d = i64(x[c]) - st.mean;
         i64 yy = floor_div(d * (1LL << (24 - st.e)) * 2 + st.sd, 2 * st.sd);
         i64 y = sat32(rshr(yy * g[c], 16) + beta[c]);
@@ -318,43 +321,39 @@ __global__ void geglu_qw_k(const int32_t* __restrict__ A, const int32_t* __restr
     quant_row_out_w<R>(v, cnt, C, hi + row * Kp, lo + row * Kp, e + row, Kp);
 }
 
-__device__ __forceinline__ int epi1(const int32_t* __restrict__ Chi, const int32_t* __restrict__ Clo, size_t ci, int n, const i64* __restrict__ wsum, const i64* __restrict__ m, const i64* __restrict__ s, const i64* __restrict__ b, int er) {
-    i64 acc = 256LL * Chi[ci] + Clo[ci] + 128LL * wsum[n];
-    return int(sat32(rshr(acc * m[n], s[n] - er) + b[n]));
-}
-__global__ void epilogue_split_k(const int32_t* __restrict__ Chi, const int32_t* __restrict__ Clo, int M, int N, int ldc, const i64* __restrict__ wsum, const i64* __restrict__ m, const i64* __restrict__ s, const i64* __restrict__ b,
+__global__ void epilogue_split_k(const int32_t* __restrict__ Chi, const int32_t* __restrict__ Clo, int M, int N, int ldc, const int4* __restrict__ cst,
                                  const int32_t* __restrict__ e, int Cs, int32_t* __restrict__ Y0, int32_t* __restrict__ Y1, int32_t* __restrict__ Y2) {
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= size_t(M) * N) return;
     int r = int(i / N), n = int(i % N); int part = n / Cs, c = n - part * Cs;
-    int v = epi1(Chi, Clo, size_t(r) * ldc + n, n, wsum, m, s, b, e[r]);
+    int v = epi1(Chi, Clo, size_t(r) * ldc + n, cst[n], e[r]);
     int32_t* Y = part == 0 ? Y0 : (part == 1 ? Y1 : Y2);
     Y[size_t(r) * Cs + c] = v;
 }
 template <int R>
-__global__ void epilogue_geglu_qw_k(const int32_t* __restrict__ Chi, const int32_t* __restrict__ Clo, int M, int F, int ldc, const i64* __restrict__ wsum, const i64* __restrict__ m, const i64* __restrict__ s, const i64* __restrict__ b,
+__global__ void epilogue_geglu_qw_k(const int32_t* __restrict__ Chi, const int32_t* __restrict__ Clo, int M, int F, int ldc, const int4* __restrict__ cst,
                                     const int32_t* __restrict__ e, const i64* __restrict__ L, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ eo, int Kp) {
     const int lane = threadIdx.x & 31; const size_t row = size_t(blockIdx.x) * 8 + (threadIdx.x >> 5);
     if (row >= size_t(M)) return;
     const int er = e[row]; const size_t base = row * ldc;
     int v[R]; int cnt = 0;
     for (int c = lane; c < F; c += 32, ++cnt) {
-        i64 a = epi1(Chi, Clo, base + c, c, wsum, m, s, b, er);
-        i64 gg = epi1(Chi, Clo, base + F + c, F + c, wsum, m, s, b, er);
+        i64 a = epi1(Chi, Clo, base + c, cst[c], er);
+        i64 gg = epi1(Chi, Clo, base + F + c, cst[F + c], er);
         i64 ge = sat32(rshr(gg * lut16(gg, L), 16));
         v[cnt] = int(sat32(rshr(a * ge, 16)));
     }
     quant_row_out_w<R>(v, cnt, F, hi + row * Kp, lo + row * Kp, eo + row, Kp);
 }
 template <int R>
-__global__ void epilogue_geglu_q_k(const int32_t* __restrict__ Chi, const int32_t* __restrict__ Clo, int F, int ldc, const i64* __restrict__ wsum, const i64* __restrict__ m, const i64* __restrict__ s, const i64* __restrict__ b,
+__global__ void epilogue_geglu_q_k(const int32_t* __restrict__ Chi, const int32_t* __restrict__ Clo, int F, int ldc, const int4* __restrict__ cst,
                                    const int32_t* __restrict__ e, const i64* __restrict__ L, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ eo, int Kp) {
     __shared__ i64 sh[32];
     const size_t row = blockIdx.x; const int er = e[row]; const size_t base = row * ldc;
     int v[R]; int cnt = 0;
     for (int c = threadIdx.x; c < F; c += NT, ++cnt) {
-        i64 a = epi1(Chi, Clo, base + c, c, wsum, m, s, b, er);
-        i64 gg = epi1(Chi, Clo, base + F + c, F + c, wsum, m, s, b, er);
+        i64 a = epi1(Chi, Clo, base + c, cst[c], er);
+        i64 gg = epi1(Chi, Clo, base + F + c, cst[F + c], er);
         i64 ge = sat32(rshr(gg * lut16(gg, L), 16));
         v[cnt] = int(sat32(rshr(a * ge, 16)));
     }
@@ -547,8 +546,8 @@ void k_quant_rows(cudaStream_t st, const int32_t* X, int M, int K, int ldx, int8
     int Mp = int((M + 31) / 32 * 32);
     quant_rows_k<<<Mp, NT, 0, st>>>(X, M, K, ldx, hi, lo, e, Kp);
 }
-void k_epilogue(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int N, int ldc, const i64* wsum, const i64* m, const i64* s, const i64* b, const int32_t* e, int32_t* Y, int ldy, const int32_t* residual) {
-    epilogue_k<<<gridFor(size_t(M) * N), NT, 0, st>>>(Chi, Clo, M, N, ldc, wsum, m, s, b, e, Y, ldy, residual);
+void k_epilogue(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int N, int ldc, const int4* cst, const int32_t* e, int32_t* Y, int ldy, const int32_t* residual) {
+    epilogue_k<<<gridFor(size_t(M) * N), NT, 0, st>>>(Chi, Clo, M, N, ldc, cst, e, Y, ldy, residual);
 }
 void k_pixmax(cudaStream_t st, const int32_t* X, int rows, int C, uint32_t* pm) { pixmax_k<<<gridFor(size_t(rows) * 32), NT, 0, st>>>(X, rows, C, pm); }
 void k_im2col3(cudaStream_t st, const int32_t* X, const uint32_t* pm, int B, int H, int W, int C, int stride, int8_t* hi, int8_t* lo, int32_t* e, int Kp) {
@@ -606,13 +605,13 @@ void k_attn_out(cudaStream_t st, const int32_t* Ohh, const int32_t* Ohl, const i
     attn_out_k<<<gridFor(size_t(B) * heads * Qc * 64), NT, 0, st>>>(Ohh, Ohl, Olh, Oll, phs, pls, vsum, ev, B, heads, Tq, q0, Qc, C, out);
 }
 void k_zero(cudaStream_t st, void* p, size_t bytes) { cudaMemsetAsync(p, 0, bytes, st); }
-void k_epilogue_split(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int N, int ldc, const i64* wsum, const i64* m, const i64* s, const i64* b, const int32_t* e, int Cs, int32_t* Y0, int32_t* Y1, int32_t* Y2) {
-    epilogue_split_k<<<gridFor(size_t(M) * N), NT, 0, st>>>(Chi, Clo, M, N, ldc, wsum, m, s, b, e, Cs, Y0, Y1, Y2);
+void k_epilogue_split(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int N, int ldc, const int4* cst, const int32_t* e, int Cs, int32_t* Y0, int32_t* Y1, int32_t* Y2) {
+    epilogue_split_k<<<gridFor(size_t(M) * N), NT, 0, st>>>(Chi, Clo, M, N, ldc, cst, e, Cs, Y0, Y1, Y2);
 }
-void k_epilogue_geglu_q(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int F, int ldc, const i64* wsum, const i64* m, const i64* s, const i64* b, const int32_t* e, const i64* Lphi, int8_t* hi, int8_t* lo, int32_t* eo, int Kp) {
-    if (F <= 1280) { if (F <= 320) epilogue_geglu_qw_k<10><<<unsigned((M + 7) / 8), NT, 0, st>>>(Chi, Clo, M, F, ldc, wsum, m, s, b, e, Lphi, hi, lo, eo, Kp); else if (F <= 640) epilogue_geglu_qw_k<20><<<unsigned((M + 7) / 8), NT, 0, st>>>(Chi, Clo, M, F, ldc, wsum, m, s, b, e, Lphi, hi, lo, eo, Kp); else epilogue_geglu_qw_k<40><<<unsigned((M + 7) / 8), NT, 0, st>>>(Chi, Clo, M, F, ldc, wsum, m, s, b, e, Lphi, hi, lo, eo, Kp); }
-    else if (F <= 12 * NT) epilogue_geglu_q_k<12><<<M, NT, 0, st>>>(Chi, Clo, F, ldc, wsum, m, s, b, e, Lphi, hi, lo, eo, Kp);
-    else if (F <= 20 * NT) epilogue_geglu_q_k<20><<<M, NT, 0, st>>>(Chi, Clo, F, ldc, wsum, m, s, b, e, Lphi, hi, lo, eo, Kp);
+void k_epilogue_geglu_q(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int F, int ldc, const int4* cst, const int32_t* e, const i64* Lphi, int8_t* hi, int8_t* lo, int32_t* eo, int Kp) {
+    if (F <= 1280) { if (F <= 320) epilogue_geglu_qw_k<10><<<unsigned((M + 7) / 8), NT, 0, st>>>(Chi, Clo, M, F, ldc, cst, e, Lphi, hi, lo, eo, Kp); else if (F <= 640) epilogue_geglu_qw_k<20><<<unsigned((M + 7) / 8), NT, 0, st>>>(Chi, Clo, M, F, ldc, cst, e, Lphi, hi, lo, eo, Kp); else epilogue_geglu_qw_k<40><<<unsigned((M + 7) / 8), NT, 0, st>>>(Chi, Clo, M, F, ldc, cst, e, Lphi, hi, lo, eo, Kp); }
+    else if (F <= 12 * NT) epilogue_geglu_q_k<12><<<M, NT, 0, st>>>(Chi, Clo, F, ldc, cst, e, Lphi, hi, lo, eo, Kp);
+    else if (F <= 20 * NT) epilogue_geglu_q_k<20><<<M, NT, 0, st>>>(Chi, Clo, F, ldc, cst, e, Lphi, hi, lo, eo, Kp);
     else throw std::runtime_error("epilogue_geglu_q: F too large");
 }
 #define ROWDISPATCH(C, KERN, ...) do { if (C <= 4 * NT) KERN<4><<<__VA_ARGS__; else if (C <= 8 * NT) KERN<8><<<__VA_ARGS__; else if (C <= 12 * NT) KERN<12><<<__VA_ARGS__; else if (C <= 20 * NT) KERN<20><<<__VA_ARGS__; else throw std::runtime_error("row kernel: C too large"); } while (0)

@@ -39,6 +39,8 @@ void DevModel::load(int dev, const Poisd& model) {
         }
         L.w = (int8_t*)dalloc(hbuf.size()); CUDA_CHECK(cudaMemcpy(L.w, hbuf.data(), hbuf.size(), cudaMemcpyHostToDevice));
         L.wsum = up64(wsum); L.m = up64(m); L.s = up64(s); L.b = up64(b);
+        { std::vector<int32_t> c(size_t(L.Np) * 4); for (int n = 0; n < L.Np; ++n) { c[4 * n] = int32_t(m[n]); c[4 * n + 1] = int32_t(s[n]); c[4 * n + 2] = int32_t(b[n]); c[4 * n + 3] = int32_t(wsum[n]); }
+          L.cst = (int4*)dalloc(c.size() * 4); CUDA_CHECK(cudaMemcpy(L.cst, c.data(), c.size() * 4, cudaMemcpyHostToDevice)); }
         lins_[base] = L;
     }
     for (const auto& kv : model.entries()) {
@@ -77,6 +79,11 @@ void DevModel::mergeLins(const std::string& name, const std::vector<std::string>
         CUDA_CHECK(cudaMemcpy(L.s + off, p->s, size_t(p->N) * 8, cudaMemcpyDeviceToDevice)); CUDA_CHECK(cudaMemcpy(L.b + off, p->b, size_t(p->N) * 8, cudaMemcpyDeviceToDevice));
         off += p->N;
     }
+    { std::vector<i64> hm(L.Np), hs(L.Np), hb(L.Np), hw(L.Np); std::vector<int32_t> c(size_t(L.Np) * 4);
+      CUDA_CHECK(cudaMemcpy(hm.data(), L.m, size_t(L.Np) * 8, cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(hs.data(), L.s, size_t(L.Np) * 8, cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(hb.data(), L.b, size_t(L.Np) * 8, cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(hw.data(), L.wsum, size_t(L.Np) * 8, cudaMemcpyDeviceToHost));
+      for (int n = 0; n < L.Np; ++n) { c[4 * n] = int32_t(hm[n]); c[4 * n + 1] = int32_t(hs[n]); c[4 * n + 2] = int32_t(hb[n]); c[4 * n + 3] = int32_t(hw[n]); }
+      L.cst = (int4*)dalloc(c.size() * 4); CUDA_CHECK(cudaMemcpy(L.cst, c.data(), c.size() * 4, cudaMemcpyHostToDevice)); }
     lins_[name] = L;
 }
 const Lin& DevModel::lin(const std::string& n) const { auto it = lins_.find(n); if (it == lins_.end()) throw std::runtime_error("no linear " + n); return it->second; }
@@ -129,7 +136,7 @@ Tensor Engine::linQ(const QuantIn& q, const Lin& L, int32_t* out, const int32_t*
     size_t mk = arena_.mark();
     int32_t* Chi = (int32_t*)arena_.alloc(size_t(2) * Mp * L.Np * 4); int32_t* Clo = Chi + size_t(Mp) * L.Np;
     gemm_.run(st_, q.hi, L.Kp, 0, L.w, L.Kp, 0, Chi, L.Np, 0, 2 * Mp, L.Np, L.Kp);
-    k_epilogue(st_, Chi, Clo, rows, L.N, L.Np, L.wsum, L.m, L.s, L.b, q.e, y.d, L.N, residual);
+    k_epilogue(st_, Chi, Clo, rows, L.N, L.Np, L.cst, q.e, y.d, L.N, residual);
     arena_.release(mk);
     return y;
 }
@@ -151,7 +158,7 @@ void Engine::linQ3(const QuantIn& q, const Lin& L, int Cs, Tensor& y0, Tensor& y
     size_t mk = arena_.mark();
     int32_t* Chi = (int32_t*)arena_.alloc(size_t(2) * Mp * L.Np * 4); int32_t* Clo = Chi + size_t(Mp) * L.Np;
     gemm_.run(st_, q.hi, L.Kp, 0, L.w, L.Kp, 0, Chi, L.Np, 0, 2 * Mp, L.Np, L.Kp);
-    k_epilogue_split(st_, Chi, Clo, rows, L.N, L.Np, L.wsum, L.m, L.s, L.b, q.e, Cs, y0.d, y1.d, y2.d);
+    k_epilogue_split(st_, Chi, Clo, rows, L.N, L.Np, L.cst, q.e, Cs, y0.d, y1.d, y2.d);
     arena_.release(mk);
 }
 QuantIn Engine::linQGegluQ(const QuantIn& q, const Lin& L, int F) {
@@ -161,7 +168,7 @@ QuantIn Engine::linQGegluQ(const QuantIn& q, const Lin& L, int F) {
     size_t mk = arena_.mark();
     int32_t* Chi = (int32_t*)arena_.alloc(size_t(2) * Mp * L.Np * 4); int32_t* Clo = Chi + size_t(Mp) * L.Np;
     gemm_.run(st_, q.hi, L.Kp, 0, L.w, L.Kp, 0, Chi, L.Np, 0, 2 * Mp, L.Np, L.Kp);
-    k_epilogue_geglu_q(st_, Chi, Clo, rows, F, L.Np, L.wsum, L.m, L.s, L.b, q.e, dm_.lutPhi, out.hi, out.lo, out.e, out.Kp);
+    k_epilogue_geglu_q(st_, Chi, Clo, rows, F, L.Np, L.cst, q.e, dm_.lutPhi, out.hi, out.lo, out.e, out.Kp);
     arena_.release(mk);
     return out;
 }
@@ -211,7 +218,7 @@ Tensor Engine::conv3(const Tensor& x, int H, int W, const Lin& L, int stride, in
     int32_t* Chi = (int32_t*)arena_.alloc(size_t(2) * Mp * L.Np * 4); int32_t* Clo = Chi + size_t(Mp) * L.Np;
     k_im2col3(st_, x.d, pm, x.B, H, W, x.C, stride, hi, lo, e, L.Kp);
     gemm_.run(st_, hi, L.Kp, 0, L.w, L.Kp, 0, Chi, L.Np, 0, 2 * Mp, L.Np, L.Kp);
-    k_epilogue(st_, Chi, Clo, rows, L.N, L.Np, L.wsum, L.m, L.s, L.b, e, y.d, L.N, residual);
+    k_epilogue(st_, Chi, Clo, rows, L.N, L.Np, L.cst, e, y.d, L.N, residual);
     arena_.release(mk);
     return y;
 }

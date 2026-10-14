@@ -21,6 +21,7 @@ public:
     void mergeLins(const std::string& name, const std::vector<std::string>& parts);
     const Norm& norm(const std::string& n) const;
     bool hasLin(const std::string& n) const { return lins_.count(n) != 0; }
+    int32_t *lutSigmoid32 = nullptr, *lutPhi32 = nullptr;
     i64 *lutSigmoid = nullptr, *lutPhi = nullptr, *lutExp = nullptr, *lutGauss = nullptr, *tePos = nullptr, *tokM = nullptr, *tokS = nullptr;
     int8_t* tokW = nullptr;
     i64 cSig = 0, cCin = 0;

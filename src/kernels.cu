@@ -35,6 +35,7 @@ struct UMaxOp { __device__ u32 operator()(u32 v) const { return warp_umax(v); } 
 __device__ __forceinline__ u32 iabs32(int v) { return v < 0 ? u32(-i64(v)) : u32(v); }
 
 // ---------------------------------------------------------------- quantisation of GEMM A operands
+template <int R> __device__ __forceinline__ void quant_row_out_w(const int* v, int cnt, int C, int8_t* h, int8_t* l, int32_t* e, int Kp);
 __global__ void quant_rows_k(const int32_t* __restrict__ X, int M, int K, int ldx, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, int Kp) {
     __shared__ i64 sh[32];
     int r = blockIdx.x;
@@ -47,23 +48,48 @@ __global__ void quant_rows_k(const int32_t* __restrict__ X, int M, int K, int ld
     int ee = row_exp(m);
     if (threadIdx.x == 0) e[r] = ee;
     for (int k = threadIdx.x; k < Kp; k += blockDim.x) {
-        i64 q = k < K ? quant16(x[k], ee) : 0;
-        int8_t a, b; split16(q, a, b); h[k] = a; l[k] = b;
+        int q = k < K ? quant16_32(x[k], ee) : 0;
+        h[k] = int8_t(q >> 8); l[k] = int8_t((q & 255) - 128);
     }
+}
+// warp per row (K <= 32*R)
+template <int R>
+__global__ void quant_rows_w_k(const int32_t* __restrict__ X, int M, int K, int ldx, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, int Kp) {
+    const int lane = threadIdx.x & 31; const size_t r = size_t(blockIdx.x) * 8 + (threadIdx.x >> 5);
+    int8_t* h = hi + r * Kp; int8_t* l = lo + r * Kp;
+    if (r >= size_t(M)) { if (r < size_t((M + 31) / 32 * 32)) for (int k = lane; k < Kp; k += 32) { h[k] = 0; l[k] = -128; } return; }
+    const int32_t* x = X + r * ldx;
+    int v[R]; int cnt = 0; u32 m = 0;
+    for (int k = lane; k < K; k += 32) { int t = x[k]; v[cnt++] = t; m = max(m, iabs32(t)); }
+    quant_row_out_w<R>(v, cnt, K, h, l, e + r, Kp);
 }
 
 __device__ __forceinline__ int epi1(const int32_t* __restrict__ Chi, const int32_t* __restrict__ Clo, size_t ci, const int4 c, int er) {
     i64 acc = 256LL * Chi[ci] + Clo[ci] + 128LL * c.w;
     return int(sat32(rshr(acc * c.x, c.y - er) + c.z));
 }
+__device__ __forceinline__ int epi1v(int chi, int clo, const int4 c, int er) {
+    i64 acc = 256LL * chi + clo + 128LL * c.w;
+    return int(sat32(rshr(acc * c.x, c.y - er) + c.z));
+}
+// 4 consecutive columns per thread (N % 4 == 0, ldc/ldy % 4 == 0): one int4 load per plane, one int4 store.
 __global__ void epilogue_k(const int32_t* __restrict__ Chi, const int32_t* __restrict__ Clo, int M, int N, int ldc, const int4* __restrict__ cst,
                            const int32_t* __restrict__ e, int32_t* __restrict__ Y, int ldy, const int32_t* R) {
-    size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= size_t(M) * N) return;
-    int r = int(i / N), n = int(i % N);
-    i64 y = epi1(Chi, Clo, size_t(r) * ldc + n, cst[n], e[r]);
-    if (R) y = sat32(y + R[size_t(r) * ldy + n]);
-    Y[size_t(r) * ldy + n] = int32_t(y);
+    const int tpr = N >> 2;                                   // threads per row
+    const int rpb = tpr >= NT ? 1 : NT / tpr;                 // rows per block
+    const int rl = threadIdx.x / tpr, n4 = threadIdx.x - rl * tpr;
+    if (rl >= rpb) return;
+    const int cb = (tpr >= NT ? blockIdx.x * NT : 0) + n4;    // column group index
+    if (cb >= tpr) return;
+    const int n = cb * 4;
+    const int4 c0 = cst[n], c1 = cst[n + 1], c2 = cst[n + 2], c3 = cst[n + 3];
+    for (int r = blockIdx.y * rpb + rl; r < M; r += gridDim.y * rpb) {
+        const int er = e[r];
+        const int4 h = *reinterpret_cast<const int4*>(Chi + size_t(r) * ldc + n), l = *reinterpret_cast<const int4*>(Clo + size_t(r) * ldc + n);
+        int4 y; y.x = epi1v(h.x, l.x, c0, er); y.y = epi1v(h.y, l.y, c1, er); y.z = epi1v(h.z, l.z, c2, er); y.w = epi1v(h.w, l.w, c3, er);
+        if (R) { const int4 rr = *reinterpret_cast<const int4*>(R + size_t(r) * ldy + n); y.x = int(sat32(i64(y.x) + rr.x)); y.y = int(sat32(i64(y.y) + rr.y)); y.z = int(sat32(i64(y.z) + rr.z)); y.w = int(sat32(i64(y.w) + rr.w)); }
+        *reinterpret_cast<int4*>(Y + size_t(r) * ldy + n) = y;
+    }
 }
 
 __global__ void pixmax_k(const int32_t* __restrict__ X, int rows, int C, u32* __restrict__ pm) {
@@ -100,7 +126,13 @@ __global__ void im2col3_k(const int32_t* __restrict__ X, const u32* __restrict__
         bool in = iy >= 0 && iy < H && ix >= 0 && ix < W;
         const int32_t* xp = in ? X + ((size_t(b) * H + iy) * W + ix) * C : nullptr;
         int8_t* ht = h + tap * C; int8_t* lt = l + tap * C;
-        for (int c = threadIdx.x; c < C; c += blockDim.x) { i64 q = in ? quant16(xp[c], ee) : 0; int8_t a, bb; split16(q, a, bb); ht[c] = a; lt[c] = bb; }
+        for (int c4 = threadIdx.x; c4 < (C >> 2); c4 += blockDim.x) {
+            int4 xv = in ? *reinterpret_cast<const int4*>(xp + c4 * 4) : make_int4(0, 0, 0, 0);
+            int q0 = in ? quant16_32(xv.x, ee) : 0, q1 = in ? quant16_32(xv.y, ee) : 0, q2 = in ? quant16_32(xv.z, ee) : 0, q3 = in ? quant16_32(xv.w, ee) : 0;
+            u32 hv = (u32(uint8_t(q0 >> 8))) | (u32(uint8_t(q1 >> 8)) << 8) | (u32(uint8_t(q2 >> 8)) << 16) | (u32(uint8_t(q3 >> 8)) << 24);
+            u32 lv = (u32(uint8_t((q0 & 255) - 128))) | (u32(uint8_t((q1 & 255) - 128)) << 8) | (u32(uint8_t((q2 & 255) - 128)) << 16) | (u32(uint8_t((q3 & 255) - 128)) << 24);
+            *reinterpret_cast<u32*>(ht + c4 * 4) = hv; *reinterpret_cast<u32*>(lt + c4 * 4) = lv;
+        }
     }
     for (int k = K + threadIdx.x; k < Kp; k += blockDim.x) { h[k] = 0; l[k] = -128; }
 }
@@ -190,7 +222,7 @@ template <int R> __device__ __forceinline__ void quant_row_out(const int* v, int
     int ee = row_exp(m);
     if (threadIdx.x == 0) *e = ee;
     int j = 0;
-    for (int c = threadIdx.x; c < C; c += NT, ++j) { i64 q = quant16(v[j], ee); int8_t a, b; split16(q, a, b); h[c] = a; l[c] = b; }
+    for (int c = threadIdx.x; c < C; c += NT, ++j) { int q = quant16_32(v[j], ee); h[c] = int8_t(q >> 8); l[c] = int8_t((q & 255) - 128); }
     for (int c = C + threadIdx.x; c < Kp; c += NT) { h[c] = 0; l[c] = -128; }
 }
 template <int R>
@@ -219,7 +251,7 @@ __global__ void lnorm_q_k(const int32_t* __restrict__ X, int C, const i64* __res
     quant_row_out<R>(v, cnt, C, hi + size_t(blockIdx.x) * Kp, lo + size_t(blockIdx.x) * Kp, e + blockIdx.x, Kp, sh);
 }
 template <int R>
-__global__ void gn_apply_row_k(const int32_t* __restrict__ X, int T, int C, int groups, const GnStat* __restrict__ gs, const i64* __restrict__ g, const i64* __restrict__ beta, const i64* __restrict__ Lsig,
+__global__ void gn_apply_row_k(const int32_t* __restrict__ X, int T, int C, int groups, const GnStat* __restrict__ gs, const i64* __restrict__ g, const i64* __restrict__ beta, const int32_t* __restrict__ Lsig,
                                int32_t* __restrict__ Y, u32* __restrict__ pm, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, int Kp) {
     __shared__ i64 sh[32];
     size_t row = blockIdx.x; int b = int(row / T); int cg = C / groups;
@@ -230,7 +262,7 @@ __global__ void gn_apply_row_k(const int32_t* __restrict__ X, int T, int C, int 
         i64 d = i64(x[c]) - st.mean;
         i64 yy = floor_div(d * (1LL << (24 - st.e)) * 2 + st.sd, 2 * st.sd);
         i64 y = sat32(rshr(yy * g[c], 16) + beta[c]);
-        if (Lsig) y = sat32(rshr(y * lut16(y, Lsig), 16));
+        if (Lsig) y = sat32(rshr(y * lut16i(y, Lsig), 16));
         v[cnt] = int(y); m = max(m, iabs32(int(y)));
     }
     if (hi) { quant_row_out<R>(v, cnt, C, hi + row * Kp, lo + row * Kp, e + row, Kp, sh); return; }
@@ -240,11 +272,11 @@ __global__ void gn_apply_row_k(const int32_t* __restrict__ X, int T, int C, int 
     if (threadIdx.x == 0) pm[row] = m;
 }
 template <int R>
-__global__ void geglu_q_k(const int32_t* __restrict__ A, const int32_t* __restrict__ G, int C, const i64* __restrict__ L, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, int Kp) {
+__global__ void geglu_q_k(const int32_t* __restrict__ A, const int32_t* __restrict__ G, int C, const int32_t* __restrict__ L, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, int Kp) {
     __shared__ i64 sh[32];
     size_t row = blockIdx.x; const int32_t* a = A + row * C; const int32_t* gg = G + row * C;
     int v[R]; int cnt = 0;
-    for (int c = threadIdx.x; c < C; c += NT, ++cnt) { i64 x = gg[c]; i64 ge = sat32(rshr(x * lut16(x, L), 16)); v[cnt] = int(sat32(rshr(i64(a[c]) * ge, 16))); }
+    for (int c = threadIdx.x; c < C; c += NT, ++cnt) { i64 x = gg[c]; i64 ge = sat32(rshr(x * lut16i(x, L), 16)); v[cnt] = int(sat32(rshr(i64(a[c]) * ge, 16))); }
     quant_row_out<R>(v, cnt, C, hi + row * Kp, lo + row * Kp, e + row, Kp, sh);
 }
 
@@ -256,7 +288,7 @@ template <int R> __device__ __forceinline__ void quant_row_out_w(const int* v, i
     m = warp_umax(m);
     int ee = row_exp(m);
     if (lane == 0) *e = ee;
-    for (int j = 0; j < cnt; ++j) { int c = lane + 32 * j; i64 q = quant16(v[j], ee); int8_t a, b; split16(q, a, b); h[c] = a; l[c] = b; }
+    for (int j = 0; j < cnt; ++j) { int c = lane + 32 * j; int q = quant16_32(v[j], ee); h[c] = int8_t(q >> 8); l[c] = int8_t((q & 255) - 128); }
     for (int c = C + lane; c < Kp; c += 32) { h[c] = 0; l[c] = -128; }
 }
 template <int R>
@@ -287,22 +319,22 @@ __global__ void lnorm_qw_k(const int32_t* __restrict__ X, int M, int C, const i6
     quant_row_out_w<R>(v, cnt, C, hi + row * Kp, lo + row * Kp, e + row, Kp);
 }
 template <int R>
-__global__ void gn_apply_roww_k(const int32_t* __restrict__ X, size_t M, int T, int C, int groups, const GnStat* __restrict__ gs, const i64* __restrict__ g, const i64* __restrict__ beta, const i64* __restrict__ Lsig,
+__global__ void gn_apply_roww_k(const int32_t* __restrict__ X, size_t M, int T, int C, int groups, const GnStat* __restrict__ gs, const i64* __restrict__ g, const i64* __restrict__ beta, const int32_t* __restrict__ Lsig,
                                 int32_t* __restrict__ Y, u32* __restrict__ pm, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, int Kp) {
     __shared__ GnStat sgs[8][32];
     const int lane = threadIdx.x & 31; const int wrow = threadIdx.x >> 5; const size_t row = size_t(blockIdx.x) * 8 + wrow;
-    int b = int(row / T); int cg = C / groups;
+    int b = int(row / T); int cg = C / groups; const float icg = 1.0f / float(cg);   // (c + 0.5) * icg is exact enough for c < 2^16, cg >= 2
     if (row < M) sgs[wrow][lane] = gs[b * groups + lane];     // 32 groups, one per lane
     __syncwarp();
     if (row >= M) return;
     const int32_t* x = X + row * C;
     int v[R]; int cnt = 0; u32 m = 0;
     for (int c = lane; c < C; c += 32, ++cnt) {
-        const GnStat& st = sgs[wrow][c / cg];
+        const GnStat& st = sgs[wrow][int((float(c) + 0.5f) * icg)];
         i64 d = i64(x[c]) - st.mean;
         i64 yy = floor_div(d * (1LL << (24 - st.e)) * 2 + st.sd, 2 * st.sd);
         i64 y = sat32(rshr(yy * g[c], 16) + beta[c]);
-        if (Lsig) y = sat32(rshr(y * lut16(y, Lsig), 16));
+        if (Lsig) y = sat32(rshr(y * lut16i(y, Lsig), 16));
         v[cnt] = int(y); m = max(m, iabs32(int(y)));
     }
     if (hi) { quant_row_out_w<R>(v, cnt, C, hi + row * Kp, lo + row * Kp, e + row, Kp); return; }
@@ -312,27 +344,25 @@ __global__ void gn_apply_roww_k(const int32_t* __restrict__ X, size_t M, int T, 
     if (lane == 0) pm[row] = m;
 }
 template <int R>
-__global__ void geglu_qw_k(const int32_t* __restrict__ A, const int32_t* __restrict__ G, int M, int C, const i64* __restrict__ L, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, int Kp) {
+__global__ void geglu_qw_k(const int32_t* __restrict__ A, const int32_t* __restrict__ G, int M, int C, const int32_t* __restrict__ L, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, int Kp) {
     const int lane = threadIdx.x & 31; const size_t row = size_t(blockIdx.x) * 8 + (threadIdx.x >> 5);
     if (row >= size_t(M)) return;
     const int32_t* a = A + row * C; const int32_t* gg = G + row * C;
     int v[R]; int cnt = 0;
-    for (int c = lane; c < C; c += 32, ++cnt) { i64 x = gg[c]; i64 ge = sat32(rshr(x * lut16(x, L), 16)); v[cnt] = int(sat32(rshr(i64(a[c]) * ge, 16))); }
+    for (int c = lane; c < C; c += 32, ++cnt) { i64 x = gg[c]; i64 ge = sat32(rshr(x * lut16i(x, L), 16)); v[cnt] = int(sat32(rshr(i64(a[c]) * ge, 16))); }
     quant_row_out_w<R>(v, cnt, C, hi + row * Kp, lo + row * Kp, e + row, Kp);
 }
 
 __global__ void epilogue_split_k(const int32_t* __restrict__ Chi, const int32_t* __restrict__ Clo, int M, int N, int ldc, const int4* __restrict__ cst,
                                  const int32_t* __restrict__ e, int Cs, int32_t* __restrict__ Y0, int32_t* __restrict__ Y1, int32_t* __restrict__ Y2) {
-    size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= size_t(M) * N) return;
-    int r = int(i / N), n = int(i % N); int part = n / Cs, c = n - part * Cs;
-    int v = epi1(Chi, Clo, size_t(r) * ldc + n, cst[n], e[r]);
-    int32_t* Y = part == 0 ? Y0 : (part == 1 ? Y1 : Y2);
-    Y[size_t(r) * Cs + c] = v;
+    int n = blockIdx.x * blockDim.x + threadIdx.x; if (n >= N) return;
+    int part = n >= 2 * Cs ? 2 : (n >= Cs ? 1 : 0), c = n - part * Cs;
+    int32_t* Y = part == 0 ? Y0 : (part == 1 ? Y1 : Y2); const int4 cc = cst[n];
+    for (int r = blockIdx.y; r < M; r += gridDim.y) Y[size_t(r) * Cs + c] = epi1(Chi, Clo, size_t(r) * ldc + n, cc, e[r]);
 }
 template <int R>
 __global__ void epilogue_geglu_qw_k(const int32_t* __restrict__ Chi, const int32_t* __restrict__ Clo, int M, int F, int ldc, const int4* __restrict__ cst,
-                                    const int32_t* __restrict__ e, const i64* __restrict__ L, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ eo, int Kp) {
+                                    const int32_t* __restrict__ e, const int32_t* __restrict__ L, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ eo, int Kp) {
     const int lane = threadIdx.x & 31; const size_t row = size_t(blockIdx.x) * 8 + (threadIdx.x >> 5);
     if (row >= size_t(M)) return;
     const int er = e[row]; const size_t base = row * ldc;
@@ -340,31 +370,31 @@ __global__ void epilogue_geglu_qw_k(const int32_t* __restrict__ Chi, const int32
     for (int c = lane; c < F; c += 32, ++cnt) {
         i64 a = epi1(Chi, Clo, base + c, cst[c], er);
         i64 gg = epi1(Chi, Clo, base + F + c, cst[F + c], er);
-        i64 ge = sat32(rshr(gg * lut16(gg, L), 16));
+        i64 ge = sat32(rshr(gg * lut16i(gg, L), 16));
         v[cnt] = int(sat32(rshr(a * ge, 16)));
     }
     quant_row_out_w<R>(v, cnt, F, hi + row * Kp, lo + row * Kp, eo + row, Kp);
 }
 template <int R>
 __global__ void epilogue_geglu_q_k(const int32_t* __restrict__ Chi, const int32_t* __restrict__ Clo, int F, int ldc, const int4* __restrict__ cst,
-                                   const int32_t* __restrict__ e, const i64* __restrict__ L, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ eo, int Kp) {
+                                   const int32_t* __restrict__ e, const int32_t* __restrict__ L, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ eo, int Kp) {
     __shared__ i64 sh[32];
     const size_t row = blockIdx.x; const int er = e[row]; const size_t base = row * ldc;
     int v[R]; int cnt = 0;
     for (int c = threadIdx.x; c < F; c += NT, ++cnt) {
         i64 a = epi1(Chi, Clo, base + c, cst[c], er);
         i64 gg = epi1(Chi, Clo, base + F + c, cst[F + c], er);
-        i64 ge = sat32(rshr(gg * lut16(gg, L), 16));
+        i64 ge = sat32(rshr(gg * lut16i(gg, L), 16));
         v[cnt] = int(sat32(rshr(a * ge, 16)));
     }
     quant_row_out<R>(v, cnt, F, hi + row * Kp, lo + row * Kp, eo + row, Kp, sh);
 }
 
 // ---------------------------------------------------------------- elementwise
-__global__ void act_k(int32_t* X, size_t n, const i64* __restrict__ L) { size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; if (i < n) { i64 x = X[i]; X[i] = int32_t(sat32(rshr(x * lut16(x, L), 16))); } }
-__global__ void geglu_k(int32_t* A, const int32_t* __restrict__ G, size_t n, const i64* __restrict__ L) {
+__global__ void act_k(int32_t* X, size_t n, const int32_t* __restrict__ L) { size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; if (i < n) { i64 x = X[i]; X[i] = int32_t(sat32(rshr(x * lut16i(x, L), 16))); } }
+__global__ void geglu_k(int32_t* A, const int32_t* __restrict__ G, size_t n, const int32_t* __restrict__ L) {
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; if (i >= n) return;
-    i64 gg = G[i]; i64 ge = sat32(rshr(gg * lut16(gg, L), 16));
+    i64 gg = G[i]; i64 ge = sat32(rshr(gg * lut16i(gg, L), 16));
     A[i] = int32_t(sat32(rshr(i64(A[i]) * ge, 16)));
 }
 __global__ void add_k(int32_t* X, const int32_t* __restrict__ Y, size_t n) { size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; if (i < n) X[i] = int32_t(sat32(i64(X[i]) + Y[i])); }
@@ -544,10 +574,13 @@ inline unsigned gridFor(size_t n) { return unsigned((n + NT - 1) / NT); }
 
 void k_quant_rows(cudaStream_t st, const int32_t* X, int M, int K, int ldx, int8_t* hi, int8_t* lo, int32_t* e, int Kp) {
     int Mp = int((M + 31) / 32 * 32);
-    quant_rows_k<<<Mp, NT, 0, st>>>(X, M, K, ldx, hi, lo, e, Kp);
+    if (K <= 1280) { unsigned grid = unsigned((Mp + 7) / 8); if (K <= 320) quant_rows_w_k<10><<<grid, NT, 0, st>>>(X, M, K, ldx, hi, lo, e, Kp); else if (K <= 640) quant_rows_w_k<20><<<grid, NT, 0, st>>>(X, M, K, ldx, hi, lo, e, Kp); else if (K <= 1024) quant_rows_w_k<32><<<grid, NT, 0, st>>>(X, M, K, ldx, hi, lo, e, Kp); else quant_rows_w_k<40><<<grid, NT, 0, st>>>(X, M, K, ldx, hi, lo, e, Kp); }
+    else quant_rows_k<<<Mp, NT, 0, st>>>(X, M, K, ldx, hi, lo, e, Kp);
 }
 void k_epilogue(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int N, int ldc, const int4* cst, const int32_t* e, int32_t* Y, int ldy, const int32_t* residual) {
-    epilogue_k<<<gridFor(size_t(M) * N), NT, 0, st>>>(Chi, Clo, M, N, ldc, cst, e, Y, ldy, residual);
+    if (N % 4 || ldc % 4 || ldy % 4) throw std::runtime_error("epilogue: N/ld must be multiples of 4");
+    int tpr = N / 4, rpb = tpr >= NT ? 1 : NT / tpr; unsigned gx = tpr >= NT ? gridFor(size_t(tpr)) : 1u; unsigned gy = unsigned(std::min<long long>((M + rpb - 1) / rpb, 65535));
+    epilogue_k<<<dim3(gx, gy), NT, 0, st>>>(Chi, Clo, M, N, ldc, cst, e, Y, ldy, residual);
 }
 void k_pixmax(cudaStream_t st, const int32_t* X, int rows, int C, uint32_t* pm) { pixmax_k<<<gridFor(size_t(rows) * 32), NT, 0, st>>>(X, rows, C, pm); }
 void k_im2col3(cudaStream_t st, const int32_t* X, const uint32_t* pm, int B, int H, int W, int C, int stride, int8_t* hi, int8_t* lo, int32_t* e, int Kp) {
@@ -573,8 +606,8 @@ void k_lnorm(cudaStream_t st, const int32_t* X, int M, int C, const i64* g, cons
     if (C > 8 * NT) throw std::runtime_error("lnorm: C too large");
     lnorm_k<<<M, NT, 0, st>>>(X, C, g, beta, den, Y);
 }
-void k_act(cudaStream_t st, int32_t* X, size_t n, const i64* L) { act_k<<<gridFor(n), NT, 0, st>>>(X, n, L); }
-void k_geglu(cudaStream_t st, int32_t* A, const int32_t* G, size_t n, const i64* L) { geglu_k<<<gridFor(n), NT, 0, st>>>(A, G, n, L); }
+void k_act(cudaStream_t st, int32_t* X, size_t n, const int32_t* L) { act_k<<<gridFor(n), NT, 0, st>>>(X, n, L); }
+void k_geglu(cudaStream_t st, int32_t* A, const int32_t* G, size_t n, const int32_t* L) { geglu_k<<<gridFor(n), NT, 0, st>>>(A, G, n, L); }
 void k_add(cudaStream_t st, int32_t* X, const int32_t* Y, size_t n) { add_k<<<gridFor(n), NT, 0, st>>>(X, Y, n); }
 void k_concat(cudaStream_t st, const int32_t* A, int Ca, const int32_t* B, int Cb, int rows, int32_t* out) { concat_k<<<gridFor(size_t(rows) * (Ca + Cb)), NT, 0, st>>>(A, Ca, B, Cb, rows, out); }
 void k_upsample2(cudaStream_t st, const int32_t* X, int B, int H, int W, int C, int32_t* out) { upsample2_k<<<gridFor(size_t(B) * 4 * H * W * C), NT, 0, st>>>(X, B, H, W, C, out); }
@@ -606,9 +639,9 @@ void k_attn_out(cudaStream_t st, const int32_t* Ohh, const int32_t* Ohl, const i
 }
 void k_zero(cudaStream_t st, void* p, size_t bytes) { cudaMemsetAsync(p, 0, bytes, st); }
 void k_epilogue_split(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int N, int ldc, const int4* cst, const int32_t* e, int Cs, int32_t* Y0, int32_t* Y1, int32_t* Y2) {
-    epilogue_split_k<<<gridFor(size_t(M) * N), NT, 0, st>>>(Chi, Clo, M, N, ldc, cst, e, Cs, Y0, Y1, Y2);
+    epilogue_split_k<<<dim3(gridFor(N), unsigned(std::min(M, 65535))), NT, 0, st>>>(Chi, Clo, M, N, ldc, cst, e, Cs, Y0, Y1, Y2);
 }
-void k_epilogue_geglu_q(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int F, int ldc, const int4* cst, const int32_t* e, const i64* Lphi, int8_t* hi, int8_t* lo, int32_t* eo, int Kp) {
+void k_epilogue_geglu_q(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int F, int ldc, const int4* cst, const int32_t* e, const int32_t* Lphi, int8_t* hi, int8_t* lo, int32_t* eo, int Kp) {
     if (F <= 1280) { if (F <= 320) epilogue_geglu_qw_k<10><<<unsigned((M + 7) / 8), NT, 0, st>>>(Chi, Clo, M, F, ldc, cst, e, Lphi, hi, lo, eo, Kp); else if (F <= 640) epilogue_geglu_qw_k<20><<<unsigned((M + 7) / 8), NT, 0, st>>>(Chi, Clo, M, F, ldc, cst, e, Lphi, hi, lo, eo, Kp); else epilogue_geglu_qw_k<40><<<unsigned((M + 7) / 8), NT, 0, st>>>(Chi, Clo, M, F, ldc, cst, e, Lphi, hi, lo, eo, Kp); }
     else if (F <= 12 * NT) epilogue_geglu_q_k<12><<<M, NT, 0, st>>>(Chi, Clo, F, ldc, cst, e, Lphi, hi, lo, eo, Kp);
     else if (F <= 20 * NT) epilogue_geglu_q_k<20><<<M, NT, 0, st>>>(Chi, Clo, F, ldc, cst, e, Lphi, hi, lo, eo, Kp);
@@ -620,12 +653,12 @@ void k_lnorm_q(cudaStream_t st, const int32_t* X, int M, int C, const i64* g, co
     if (C <= 1280) WARPDISPATCH(C, lnorm_qw_k, unsigned((M + 7) / 8), X, M, C, g, beta, den, hi, lo, e, Kp);
     else ROWDISPATCH(C, lnorm_q_k, M, NT, 0, st>>>(X, C, g, beta, den, hi, lo, e, Kp));
 }
-void k_gn_apply_row(cudaStream_t st, const int32_t* X, int B, int T, int C, int groups, const GnStat* gs, const i64* g, const i64* beta, const i64* Lsig, int32_t* Y, uint32_t* pm, int8_t* hi, int8_t* lo, int32_t* e, int Kp) {
+void k_gn_apply_row(cudaStream_t st, const int32_t* X, int B, int T, int C, int groups, const GnStat* gs, const i64* g, const i64* beta, const int32_t* Lsig, int32_t* Y, uint32_t* pm, int8_t* hi, int8_t* lo, int32_t* e, int Kp) {
     size_t M = size_t(B) * T;
     if (C <= 1280) WARPDISPATCH(C, gn_apply_roww_k, unsigned((M + 7) / 8), X, M, T, C, groups, gs, g, beta, Lsig, Y, pm, hi, lo, e, Kp);
     else ROWDISPATCH(C, gn_apply_row_k, unsigned(M), NT, 0, st>>>(X, T, C, groups, gs, g, beta, Lsig, Y, pm, hi, lo, e, Kp));
 }
-void k_geglu_q(cudaStream_t st, const int32_t* A, const int32_t* G, int M, int C, const i64* Lphi, int8_t* hi, int8_t* lo, int32_t* e, int Kp) {
+void k_geglu_q(cudaStream_t st, const int32_t* A, const int32_t* G, int M, int C, const int32_t* Lphi, int8_t* hi, int8_t* lo, int32_t* e, int Kp) {
     if (C <= 1280) WARPDISPATCH(C, geglu_qw_k, unsigned((M + 7) / 8), A, G, M, C, Lphi, hi, lo, e, Kp);
     else ROWDISPATCH(C, geglu_q_k, M, NT, 0, st>>>(A, G, C, Lphi, hi, lo, e, Kp));
 }

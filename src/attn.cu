@@ -122,11 +122,12 @@ __global__ void __launch_bounds__(NTHR, (PASS == 2 ? 2 : 3)) attn_pass_k(
         const int8_t* Kh = S.khi[buf]; const int8_t* Kl = S.klo[buf]; const i64* Ks = S.ksum[buf]; const int32_t* Ke = S.ek[buf];
         const bool fullTile = (k0 + TK <= Tk) && !causal;       // no per-element validity checks needed
         // scores: this warp -> n-tiles kh*4 .. kh*4+3 (8 keys each), two n-tiles per scalar block for ILP
-        for (int np = 0; np < 2; ++np) {
-            int32_t hh[2][4], hl[2][4], lh[2][4], ll[2][4];
+        constexpr int NU = 2;                                    // n-tiles per scalar block (4 spills at 80 regs and is slower)
+        for (int np = 0; np < 4 / NU; ++np) {
+            int32_t hh[NU][4], hl[NU][4], lh[NU][4], ll[NU][4];
             #pragma unroll
-            for (int u = 0; u < 2; ++u) {
-                const int nt = kh * 4 + np * 2 + u, kb = nt * 8;
+            for (int u = 0; u < NU; ++u) {
+                const int nt = kh * 4 + np * NU + u, kb = nt * 8;
                 for (int j = 0; j < 4; ++j) { hh[u][j] = 0; hl[u][j] = 0; lh[u][j] = 0; ll[u][j] = 0; }
                 for (int ks = 0; ks < 2; ++ks) {
                     uint32_t bf[4];      // {bh0, bh1, bl0, bl1}: matrices 0/1 = K hi dims +0/+16, 2/3 = K lo
@@ -135,8 +136,8 @@ __global__ void __launch_bounds__(NTHR, (PASS == 2 ? 2 : 3)) attn_pass_k(
                 }
             }
             #pragma unroll
-            for (int u = 0; u < 2; ++u) {
-                const int nt = kh * 4 + np * 2 + u, kb = nt * 8;
+            for (int u = 0; u < NU; ++u) {
+                const int nt = kh * 4 + np * NU + u, kb = nt * 8;
                 const int kl0 = kb + t4 * 2; const int key0 = k0 + kl0;
                 const int ekk[2] = {Ke[kl0], Ke[kl0 + 1]}; const int kk[2] = {int(Ks[kl0] * 128), int(Ks[kl0 + 1] * 128)};
                 int8_t ph[4], pl[4]; unsigned es0 = 0, es1 = 0; int phs_t0 = 0, pls_t0 = 0, phs_t1 = 0, pls_t1 = 0;

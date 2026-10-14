@@ -51,7 +51,9 @@ void DevModel::load(int dev, const Poisd& model) {
         Norm nm; auto g = model.i32v(name); nm.C = int(g.size()); nm.g = up64(g); nm.beta = up64(model.i32v(base + ".beta")); nm.den = model.i32s(base + ".eps");
         norms_[base] = nm;
     }
-    lutSigmoid = up64(model.i32v("lut.sigmoid")); lutPhi = up64(model.i32v("lut.phi")); lutExp = up64(model.i32v("lut.exp")); lutGauss = up64(model.i32v("lut.gauss"));
+    lutSigmoid = up64(model.i32v("lut.sigmoid")); lutPhi = up64(model.i32v("lut.phi"));
+    { auto up32 = [&](const std::vector<i64>& v) { std::vector<int32_t> h(v.begin(), v.end()); int32_t* p = (int32_t*)dalloc(h.size() * 4); CUDA_CHECK(cudaMemcpy(p, h.data(), h.size() * 4, cudaMemcpyHostToDevice)); return p; };
+      lutSigmoid32 = up32(model.i32v("lut.sigmoid")); lutPhi32 = up32(model.i32v("lut.phi")); } lutExp = up64(model.i32v("lut.exp")); lutGauss = up64(model.i32v("lut.gauss"));
     tePos = up64(model.i32v("te.pos")); tokM = up64(model.i32v("te.tok.m")); tokS = up64(model.i32v("te.tok.s"));
     const PoisdTensor& tw = model.get("te.tok.w"); tokW = (int8_t*)dalloc(tw.bytes()); CUDA_CHECK(cudaMemcpy(tokW, model.i8("te.tok.w"), tw.bytes(), cudaMemcpyHostToDevice));
     cSig = model.i32s("c.sig"); cCin = model.i32s("c.cin");
@@ -168,7 +170,7 @@ QuantIn Engine::linQGegluQ(const QuantIn& q, const Lin& L, int F) {
     size_t mk = arena_.mark();
     int32_t* Chi = (int32_t*)arena_.alloc(size_t(2) * Mp * L.Np * 4); int32_t* Clo = Chi + size_t(Mp) * L.Np;
     gemm_.run(st_, q.hi, L.Kp, 0, L.w, L.Kp, 0, Chi, L.Np, 0, 2 * Mp, L.Np, L.Kp);
-    k_epilogue_geglu_q(st_, Chi, Clo, rows, F, L.Np, L.cst, q.e, dm_.lutPhi, out.hi, out.lo, out.e, out.Kp);
+    k_epilogue_geglu_q(st_, Chi, Clo, rows, F, L.Np, L.cst, q.e, dm_.lutPhi32, out.hi, out.lo, out.e, out.Kp);
     arena_.release(mk);
     return out;
 }
@@ -197,13 +199,13 @@ Tensor Engine::groupnormSilu(const Tensor& x, const Norm& nm, u32*& pm) {
     GnStat* gs = (GnStat*)arena_.alloc(sizeof(GnStat) * x.B * 32);
     k_gn_stats1(st_, x.d, x.B, x.T, x.C, 32, gs);
     k_gn_stats2(st_, x.d, x.B, x.T, x.C, 32, nm.den, gs);
-    k_gn_apply_row(st_, x.d, x.B, x.T, x.C, 32, gs, nm.g, nm.beta, dm_.lutSigmoid, y.d, pm, nullptr, nullptr, nullptr, 0);
+    k_gn_apply_row(st_, x.d, x.B, x.T, x.C, 32, gs, nm.g, nm.beta, dm_.lutSigmoid32, y.d, pm, nullptr, nullptr, nullptr, 0);
     arena_.release(mk);
     return y;
 }
 QuantIn Engine::gegluQ(const Tensor& a, const Tensor& g) {
     QuantIn q = qalloc(a.B, a.T, a.C);
-    k_geglu_q(st_, a.d, g.d, q.rows(), a.C, dm_.lutPhi, q.hi, q.lo, q.e, q.Kp);
+    k_geglu_q(st_, a.d, g.d, q.rows(), a.C, dm_.lutPhi32, q.hi, q.lo, q.e, q.Kp);
     return q;
 }
 Tensor Engine::conv3(const Tensor& x, int H, int W, const Lin& L, int stride, int32_t* out, const int32_t* residual, const u32* pmIn) {
@@ -239,7 +241,7 @@ Tensor Engine::layernorm(const Tensor& x, const Norm& nm) {
     k_lnorm(st_, x.d, x.B * x.T, x.C, nm.g, nm.beta, nm.den, y.d);
     return y;
 }
-void Engine::silu(Tensor& x) { k_act(st_, x.d, x.n(), dm_.lutSigmoid); }
+void Engine::silu(Tensor& x) { k_act(st_, x.d, x.n(), dm_.lutSigmoid32); }
 
 AttnKV Engine::quantKV(const Tensor& k, const Tensor& v, int heads) {
     AttnKV kv; kv.Tk = k.T; kv.Tkp = int(align_up(k.T, 64)); int G = k.B * heads;
@@ -395,7 +397,7 @@ Tensor Engine::textEncoder(const std::vector<int>& ids) {
         lin(a, dm_.lin(p + ".self_attn.out_proj"), x.d, x.d);
         arena_.release(mk); mk = arena_.mark();
         QuantIn n2 = layernormQ(x, dm_.norm(p + ".layer_norm2"));
-        Tensor f = linQ(n2, dm_.lin(p + ".mlp.fc1")); k_act(st_, f.d, f.n(), dm_.lutPhi);
+        Tensor f = linQ(n2, dm_.lin(p + ".mlp.fc1")); k_act(st_, f.d, f.n(), dm_.lutPhi32);
         lin(f, dm_.lin(p + ".mlp.fc2"), x.d, x.d);
         arena_.release(mk);
     }

@@ -24,8 +24,8 @@ void k_gn_stats2(cudaStream_t st, const int32_t* X, int B, int T, int C, int gro
 void k_gn_apply(cudaStream_t st, const int32_t* X, int B, int T, int C, int groups, const GnStat* gs, const i64* g, const i64* beta, int32_t* Y);
 // LayerNorm over rows of X[M, C]
 void k_lnorm(cudaStream_t st, const int32_t* X, int M, int C, const i64* g, const i64* beta, i64 den, int32_t* Y);
-void k_act(cudaStream_t st, int32_t* X, size_t n, const i64* L);                     // x = sat32(rshr(x*lut(x),16)) in place
-void k_geglu(cudaStream_t st, int32_t* A, const int32_t* G, size_t n, const i64* Lphi); // a = sat32(rshr(a*gelu(g),16))
+void k_act(cudaStream_t st, int32_t* X, size_t n, const int32_t* L);                     // x = sat32(rshr(x*lut(x),16)) in place
+void k_geglu(cudaStream_t st, int32_t* A, const int32_t* G, size_t n, const int32_t* Lphi); // a = sat32(rshr(a*gelu(g),16))
 void k_add(cudaStream_t st, int32_t* X, const int32_t* Y, size_t n);                  // x = sat32(x+y)
 void k_concat(cudaStream_t st, const int32_t* A, int Ca, const int32_t* B, int Cb, int rows, int32_t* out);
 void k_upsample2(cudaStream_t st, const int32_t* X, int B, int H, int W, int C, int32_t* out);
@@ -56,14 +56,14 @@ void k_zero(cudaStream_t st, void* p, size_t bytes);
 // Row kernels that emit the quantised GEMM operand directly (hi/lo [*, Kp], e[row]); C <= 5120, Kp >= C.
 void k_lnorm_q(cudaStream_t st, const int32_t* X, int M, int C, const i64* g, const i64* beta, i64 den, int8_t* hi, int8_t* lo, int32_t* e, int Kp);
 // GroupNorm apply (+ optional SiLU); block per pixel row. Either quantised output (hi/lo/e, when hi != nullptr) or int32 Y plus the pixel max pm.
-void k_gn_apply_row(cudaStream_t st, const int32_t* X, int B, int T, int C, int groups, const GnStat* gs, const i64* g, const i64* beta, const i64* Lsig,
+void k_gn_apply_row(cudaStream_t st, const int32_t* X, int B, int T, int C, int groups, const GnStat* gs, const i64* g, const i64* beta, const int32_t* Lsig,
                     int32_t* Y, uint32_t* pm, int8_t* hi, int8_t* lo, int32_t* e, int Kp);
 // a = sat32(rshr(a*gelu(g),16)) quantised per row
-void k_geglu_q(cudaStream_t st, const int32_t* A, const int32_t* G, int M, int C, const i64* Lphi, int8_t* hi, int8_t* lo, int32_t* e, int Kp);
+void k_geglu_q(cudaStream_t st, const int32_t* A, const int32_t* G, int M, int C, const int32_t* Lphi, int8_t* hi, int8_t* lo, int32_t* e, int Kp);
 // Epilogue of a merged GEMM whose N = parts*Cs: column n -> output Y[n / Cs][row][n % Cs] (up to 3 outputs).
 void k_epilogue_split(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int N, int ldc, const int4* cst, const int32_t* e, int Cs, int32_t* Y0, int32_t* Y1, int32_t* Y2);
 // Epilogue of the merged GEGLU GEMM (N = 2F: [a | g]) fused with a = sat32(rshr(a*gelu(g),16)) and row quantisation -> hi/lo/e [*, Kp>=F].
-void k_epilogue_geglu_q(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int F, int ldc, const int4* cst, const int32_t* e, const i64* Lphi, int8_t* hi, int8_t* lo, int32_t* eo, int Kp);
+void k_epilogue_geglu_q(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int F, int ldc, const int4* cst, const int32_t* e, const int32_t* Lphi, int8_t* hi, int8_t* lo, int32_t* eo, int Kp);
 }  // namespace meow
 namespace meow {
 // Fused exact attention on tensor cores (attn.cu). Tqp, Tkp multiples of 64; K/V operands from k_quant_heads / k_quant_v.

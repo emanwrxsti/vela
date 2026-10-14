@@ -248,6 +248,76 @@ __global__ void geglu_q_k(const int32_t* __restrict__ A, const int32_t* __restri
     quant_row_out<R>(v, cnt, C, hi + row * Kp, lo + row * Kp, e + row, Kp, sh);
 }
 
+// Warp-per-row variants (C <= 32*R): no shared memory, no block barriers. 8 rows per block.
+template <int R> __device__ __forceinline__ void quant_row_out_w(const int* v, int cnt, int C, int8_t* h, int8_t* l, int32_t* e, int Kp) {
+    const int lane = threadIdx.x & 31;
+    u32 m = 0;
+    for (int j = 0; j < cnt; ++j) m = max(m, iabs32(v[j]));
+    m = warp_umax(m);
+    int ee = row_exp(m);
+    if (lane == 0) *e = ee;
+    for (int j = 0; j < cnt; ++j) { int c = lane + 32 * j; i64 q = quant16(v[j], ee); int8_t a, b; split16(q, a, b); h[c] = a; l[c] = b; }
+    for (int c = C + lane; c < Kp; c += 32) { h[c] = 0; l[c] = -128; }
+}
+template <int R>
+__global__ void lnorm_qw_k(const int32_t* __restrict__ X, int M, int C, const i64* __restrict__ g, const i64* __restrict__ beta, i64 den, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, int Kp) {
+    const int lane = threadIdx.x & 31; const size_t row = size_t(blockIdx.x) * 8 + (threadIdx.x >> 5);
+    if (row >= size_t(M)) return;
+    const int32_t* x = X + row * C;
+    int v[R]; int cnt = 0;
+    i64 sum = 0; int mn = INT_MAX, mx = INT_MIN;
+    for (int c = lane; c < C; c += 32) { int t = x[c]; v[cnt++] = t; sum += t; mn = min(mn, t); mx = max(mx, t); }
+    sum = warp_sum(sum); mn = warp_min(mn); mx = warp_max(mx);
+    i64 n = C, mean = floor_div(sum + n / 2, n);
+    int ex = max(0, row_exp(max(mx - mean, mean - mn)) - 5);
+    i64 ss = 0;
+    for (int j = 0; j < cnt; ++j) { i64 dd = rshr(i64(v[j]) - mean, ex); ss += dd * dd; }
+    ss = warp_sum(ss);
+    i64 var = floor_div(ss, n);
+    int shb = 32 - 2 * ex; i64 one = shb >= 0 ? (1LL << shb) : 0;
+    i64 eps = floor_div(one + den / 2, den);
+    i64 sd = isqrt_i64((var + eps) << 16);
+    i64 sd2 = 2 * sd;
+    for (int j = 0; j < cnt; ++j) {
+        int c = lane + 32 * j;
+        i64 d = i64(v[j]) - mean;
+        i64 yy = floor_div(d * (1LL << (24 - ex)) * 2 + sd, sd2);
+        v[j] = int(sat32(rshr(yy * g[c], 16) + beta[c]));
+    }
+    quant_row_out_w<R>(v, cnt, C, hi + row * Kp, lo + row * Kp, e + row, Kp);
+}
+template <int R>
+__global__ void gn_apply_roww_k(const int32_t* __restrict__ X, size_t M, int T, int C, int groups, const GnStat* __restrict__ gs, const i64* __restrict__ g, const i64* __restrict__ beta, const i64* __restrict__ Lsig,
+                                int32_t* __restrict__ Y, u32* __restrict__ pm, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, int Kp) {
+    const int lane = threadIdx.x & 31; const size_t row = size_t(blockIdx.x) * 8 + (threadIdx.x >> 5);
+    if (row >= M) return;
+    int b = int(row / T); int cg = C / groups;
+    const int32_t* x = X + row * C;
+    int v[R]; int cnt = 0; u32 m = 0;
+    for (int c = lane; c < C; c += 32, ++cnt) {
+        GnStat st = gs[b * groups + c / cg];
+        i64 d = i64(x[c]) - st.mean;
+        i64 yy = floor_div(d * (1LL << (24 - st.e)) * 2 + st.sd, 2 * st.sd);
+        i64 y = sat32(rshr(yy * g[c], 16) + beta[c]);
+        if (Lsig) y = sat32(rshr(y * lut16(y, Lsig), 16));
+        v[cnt] = int(y); m = max(m, iabs32(int(y)));
+    }
+    if (hi) { quant_row_out_w<R>(v, cnt, C, hi + row * Kp, lo + row * Kp, e + row, Kp); return; }
+    int32_t* y = Y + row * C;
+    for (int j = 0; j < cnt; ++j) y[lane + 32 * j] = v[j];
+    m = warp_umax(m);
+    if (lane == 0) pm[row] = m;
+}
+template <int R>
+__global__ void geglu_qw_k(const int32_t* __restrict__ A, const int32_t* __restrict__ G, int M, int C, const i64* __restrict__ L, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, int Kp) {
+    const int lane = threadIdx.x & 31; const size_t row = size_t(blockIdx.x) * 8 + (threadIdx.x >> 5);
+    if (row >= size_t(M)) return;
+    const int32_t* a = A + row * C; const int32_t* gg = G + row * C;
+    int v[R]; int cnt = 0;
+    for (int c = lane; c < C; c += 32, ++cnt) { i64 x = gg[c]; i64 ge = sat32(rshr(x * lut16(x, L), 16)); v[cnt] = int(sat32(rshr(i64(a[c]) * ge, 16))); }
+    quant_row_out_w<R>(v, cnt, C, hi + row * Kp, lo + row * Kp, e + row, Kp);
+}
+
 // ---------------------------------------------------------------- elementwise
 __global__ void act_k(int32_t* X, size_t n, const i64* __restrict__ L) { size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; if (i < n) { i64 x = X[i]; X[i] = int32_t(sat32(rshr(x * lut16(x, L), 16))); } }
 __global__ void geglu_k(int32_t* A, const int32_t* __restrict__ G, size_t n, const i64* __restrict__ L) {
@@ -494,13 +564,18 @@ void k_attn_out(cudaStream_t st, const int32_t* Ohh, const int32_t* Ohl, const i
 }
 void k_zero(cudaStream_t st, void* p, size_t bytes) { cudaMemsetAsync(p, 0, bytes, st); }
 #define ROWDISPATCH(C, KERN, ...) do { if (C <= 4 * NT) KERN<4><<<__VA_ARGS__; else if (C <= 8 * NT) KERN<8><<<__VA_ARGS__; else if (C <= 12 * NT) KERN<12><<<__VA_ARGS__; else if (C <= 20 * NT) KERN<20><<<__VA_ARGS__; else throw std::runtime_error("row kernel: C too large"); } while (0)
+#define WARPDISPATCH(C, KERN, GRID, ...) do { if (C <= 320) KERN<10><<<GRID, NT, 0, st>>>(__VA_ARGS__); else if (C <= 640) KERN<20><<<GRID, NT, 0, st>>>(__VA_ARGS__); else if (C <= 1024) KERN<32><<<GRID, NT, 0, st>>>(__VA_ARGS__); else KERN<40><<<GRID, NT, 0, st>>>(__VA_ARGS__); } while (0)
 void k_lnorm_q(cudaStream_t st, const int32_t* X, int M, int C, const i64* g, const i64* beta, i64 den, int8_t* hi, int8_t* lo, int32_t* e, int Kp) {
-    ROWDISPATCH(C, lnorm_q_k, M, NT, 0, st>>>(X, C, g, beta, den, hi, lo, e, Kp));
+    if (C <= 1280) WARPDISPATCH(C, lnorm_qw_k, unsigned((M + 7) / 8), X, M, C, g, beta, den, hi, lo, e, Kp);
+    else ROWDISPATCH(C, lnorm_q_k, M, NT, 0, st>>>(X, C, g, beta, den, hi, lo, e, Kp));
 }
 void k_gn_apply_row(cudaStream_t st, const int32_t* X, int B, int T, int C, int groups, const GnStat* gs, const i64* g, const i64* beta, const i64* Lsig, int32_t* Y, uint32_t* pm, int8_t* hi, int8_t* lo, int32_t* e, int Kp) {
-    ROWDISPATCH(C, gn_apply_row_k, unsigned(size_t(B) * T), NT, 0, st>>>(X, T, C, groups, gs, g, beta, Lsig, Y, pm, hi, lo, e, Kp));
+    size_t M = size_t(B) * T;
+    if (C <= 1280) WARPDISPATCH(C, gn_apply_roww_k, unsigned((M + 7) / 8), X, M, T, C, groups, gs, g, beta, Lsig, Y, pm, hi, lo, e, Kp);
+    else ROWDISPATCH(C, gn_apply_row_k, unsigned(M), NT, 0, st>>>(X, T, C, groups, gs, g, beta, Lsig, Y, pm, hi, lo, e, Kp));
 }
 void k_geglu_q(cudaStream_t st, const int32_t* A, const int32_t* G, int M, int C, const i64* Lphi, int8_t* hi, int8_t* lo, int32_t* e, int Kp) {
-    ROWDISPATCH(C, geglu_q_k, M, NT, 0, st>>>(A, G, C, Lphi, hi, lo, e, Kp));
+    if (C <= 1280) WARPDISPATCH(C, geglu_qw_k, unsigned((M + 7) / 8), A, G, M, C, Lphi, hi, lo, e, Kp);
+    else ROWDISPATCH(C, geglu_q_k, M, NT, 0, st>>>(A, G, C, Lphi, hi, lo, e, Kp));
 }
 }  // namespace meow

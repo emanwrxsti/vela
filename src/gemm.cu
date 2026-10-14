@@ -35,17 +35,37 @@ Gemm::Plan& Gemm::plan(int M, int N, int K, int lda, int ldw, int ldc, long long
     }
     cublasLtMatmulPreference_t pref; LT_CHECK(cublasLtMatmulPreferenceCreate(&pref));
     LT_CHECK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsBytes_, sizeof(wsBytes_)));
-    cublasLtMatmulHeuristicResult_t res[8]; int nres = 0;
-    LT_CHECK(cublasLtMatmulAlgoGetHeuristic(lt_, p.op, p.a, p.b, p.c, p.c, pref, 8, res, &nres));
+    cublasLtMatmulHeuristicResult_t res[16]; int nres = 0;
+    LT_CHECK(cublasLtMatmulAlgoGetHeuristic(lt_, p.op, p.a, p.b, p.c, p.c, pref, 16, res, &nres));
     cublasLtMatmulPreferenceDestroy(pref);
     if (nres == 0) throw std::runtime_error("cublasLt: no int8 GEMM algorithm for M=" + std::to_string(M) + " N=" + std::to_string(N) + " K=" + std::to_string(K) + " batch=" + std::to_string(batch));
-    p.algo = res[0].algo; p.haveAlgo = true;
+    p.algo = res[0].algo; p.haveAlgo = true; p.nCand = 0;
+    for (int i = 0; i < nres && i < 16; ++i) if (res[i].state == CUBLAS_STATUS_SUCCESS) p.cand[p.nCand++] = res[i].algo;
     return plans_.emplace(key, p).first->second;
 }
 void Gemm::run(cudaStream_t st, const int8_t* A, int lda, long long strideA, const int8_t* W, int ldw, long long strideW,
                int32_t* C, int ldc, long long strideC, int M, int N, int K, int batch) {
     Plan& p = plan(M, N, K, lda, ldw, ldc, strideA, strideW, strideC, batch);
     int32_t alpha = 1, beta = 0;
+    if (p.nCand > 1) {
+        // Autotune once per shape (eager runs only — never inside stream capture): time every heuristic candidate, keep the fastest.
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone; cudaStreamIsCapturing(st, &cs);
+        if (cs == cudaStreamCaptureStatusNone) {
+            cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+            float best = 1e30f; int bi = 0;
+            for (int i = 0; i < p.nCand; ++i) {
+                if (cublasLtMatmul(lt_, p.op, &alpha, W, p.a, A, p.b, &beta, C, p.c, C, p.c, &p.cand[i], ws_, wsBytes_, st) != CUBLAS_STATUS_SUCCESS) continue;   // warm
+                cudaEventRecord(e0, st);
+                for (int r = 0; r < 3; ++r) cublasLtMatmul(lt_, p.op, &alpha, W, p.a, A, p.b, &beta, C, p.c, C, p.c, &p.cand[i], ws_, wsBytes_, st);
+                cudaEventRecord(e1, st); cudaEventSynchronize(e1);
+                float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+                if (ms < best) { best = ms; bi = i; }
+            }
+            cudaEventDestroy(e0); cudaEventDestroy(e1);
+            p.algo = p.cand[bi];
+        }
+        p.nCand = 0;      // tuned (or capture-time fallback to the heuristic's first choice)
+    }
     LT_CHECK(cublasLtMatmul(lt_, p.op, &alpha, W, p.a, A, p.b, &beta, C, p.c, C, p.c, &p.algo, ws_, wsBytes_, st));
 }
 }  // namespace meow

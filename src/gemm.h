@@ -16,7 +16,7 @@ public:
     void run(cudaStream_t st, const int8_t* A, int lda, long long strideA, const int8_t* W, int ldw, long long strideW,
              int32_t* C, int ldc, long long strideC, int M, int N, int K, int batch = 1);
 private:
-    struct Plan { cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; bool haveAlgo; };
+    struct Plan { cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; bool haveAlgo; cublasLtMatmulAlgo_t cand[16]; int nCand; };
     Plan& plan(int M, int N, int K, int lda, int ldw, int ldc, long long sA, long long sW, long long sC, int batch);
     cublasLtHandle_t lt_ = nullptr; void* ws_ = nullptr; size_t wsBytes_ = 0;
     std::map<std::tuple<int, int, int, int, int, int, long long, long long, long long, int>, Plan> plans_;

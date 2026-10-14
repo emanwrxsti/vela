@@ -102,6 +102,9 @@ static int runSingle(const Opts& o, const Poisd& model, const std::vector<int>& 
 }
 
 // ------------------------------------------------------------------ benchmark
+#ifdef MEOW_ATTN_STATS
+namespace meow { void k_attn_stats_dump(); }
+#endif
 static int runBench(const Opts& o, const Poisd& model, const std::vector<int>& devs) {
     std::vector<int> tokens = {320, 736, 3240};
     std::atomic<uint64_t> total{0};
@@ -115,6 +118,8 @@ static int runBench(const Opts& o, const Poisd& model, const std::vector<int>& d
             cfg.arenaBytes = o.memMB ? (o.memMB << 20) : (freeB - (768u << 20)) / o.lanes;
             std::vector<std::unique_ptr<Engine>> lanes; for (int l = 0; l < o.lanes; ++l) { lanes.emplace_back(new Engine(dm, cfg)); lanes.back()->setPrompt(tokens); }
             std::vector<std::thread> lt; std::atomic<uint64_t> devTotal{0};
+            // warm-up (graph capture + cuBLASLt autotune) is excluded from the timed window
+            { std::vector<uint8_t> seeds(size_t(o.batch) * 32, 7), x0(size_t(o.batch) * 32768); for (auto& e : lanes) { e->run(seeds.data(), x0.data()); e->run(seeds.data(), x0.data()); } }
             auto td = std::chrono::steady_clock::now();
             for (int l = 0; l < o.lanes; ++l) lt.emplace_back([&, l] {
                 std::mt19937_64 rng(dev * 100 + l); std::vector<uint8_t> seeds(size_t(o.batch) * 32), x0(size_t(o.batch) * 32768);
@@ -132,6 +137,9 @@ static int runBench(const Opts& o, const Poisd& model, const std::vector<int>& d
         } catch (const std::exception& e) { logln("GPU " + std::to_string(dev) + " bench error: " + e.what()); }
     });
     for (auto& t : ths) t.join();
+#ifdef MEOW_ATTN_STATS
+    meow::k_attn_stats_dump();
+#endif
     double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     logln("TOTAL " + std::to_string(total.load()) + " inferences, " + std::to_string(total / s) + " inf/s incl. setup");
     return 0;

@@ -8,6 +8,7 @@
 #include "intops.cuh"
 #include <climits>
 #include <stdexcept>
+#include <cstdio>
 
 namespace meow {
 namespace {
@@ -17,12 +18,12 @@ struct __align__(16) Smem {
     int8_t khi[TK * LD], klo[TK * LD];      // K tile  [key][dim]
     int8_t vhi[64 * LD], vlo[64 * LD];      // V tile  [dim][key]
     int8_t phi[TQ * LD], plo[TQ * LD];      // P tile  [query][key]
-    i64 ksum[TK]; int32_t ek[TK];
-    i64 cq[TQ]; int32_t eq[TQ];
+    int32_t k128[TK]; int32_t ek[TK];          // 128*ksum fits int32 (|ksum| <= 64*32767)
+    int32_t cq[TQ]; int32_t eq[TQ];            // 32768*qhs + 128*qls fits int32
     int32_t mxh[2][TQ]; i64 sumh[2][TQ]; i64 phsh[2][TQ], plsh[2][TQ];
     int32_t mx[TQ]; i64 r[TQ];
     int32_t vev[64]; i64 vvsum[64];
-    i64 lexp[1025];
+    int32_t lexp[1025];                        // values <= 2^30
 };
 
 __device__ __forceinline__ void mma_s8(int32_t* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
@@ -30,11 +31,20 @@ __device__ __forceinline__ void mma_s8(int32_t* c, const uint32_t* a, uint32_t b
                  : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 __device__ __forceinline__ uint32_t ld32(const int8_t* p) { return *reinterpret_cast<const uint32_t*>(p); }
-__device__ __forceinline__ i64 lutexp(i64 z, const i64* L) {
-    if (z >= (16LL << 16)) return 0;
-    i64 i = z >> 10, f = z & 1023;
-    i64 a = L[i], b = L[i + 1];
-    return a + (((b - a) * f) >> 10);
+/** Exact score: s = rshr((hh<<16) + T, sh), saturated to int32. T = 256*(hl+lh) + ll + cq + 128*ksum (|T| < 2^31). */
+__device__ __forceinline__ int score(int hh, int T, int sh) {
+    i64 S = (i64(hh) << 16) + T;
+    i64 v;
+    if (sh >= 0) v = (S + ((1LL << sh) >> 1)) >> sh;
+    else { int neg = -sh; i64 lim = 1LL << (62 - neg); v = (S < -lim ? -lim : (S > lim ? lim : S)) << neg; }
+    return int(v < INT_MIN ? INT_MIN : (v > INT_MAX ? INT_MAX : v));
+}
+/** E = LUT(z) for z = mx - s >= 0 (uint32), 0 when z >= 2^20. */
+__device__ __forceinline__ int lutexp32(unsigned z, const int32_t* L) {
+    if (z >= (16u << 16)) return 0;
+    int i = int(z >> 10), f = int(z & 1023);
+    int a = L[i], b = L[i + 1];
+    return a + int((i64(b - a) * f) >> 10);
 }
 
 __global__ void __launch_bounds__(NTHR, 2) fused_attn_k(
@@ -49,9 +59,9 @@ __global__ void __launch_bounds__(NTHR, 2) fused_attn_k(
     const int gid = lane >> 2, t4 = lane & 3;                    // mma fragment coordinates
     const int b = g / heads, h = g % heads;
     if (q0 >= Tq) return;
-    for (int i = tid; i < TQ; i += NTHR) { int rq = g * Tqp + q0 + i; S.cq[i] = 32768LL * qhs[rq] + 128LL * qls[rq]; S.eq[i] = eq[rq]; }
+    for (int i = tid; i < TQ; i += NTHR) { int rq = g * Tqp + q0 + i; S.cq[i] = int(32768LL * qhs[rq] + 128LL * qls[rq]); S.eq[i] = eq[rq]; }
     for (int i = tid; i < 64; i += NTHR) { S.vev[i] = ev[g * 64 + i]; S.vvsum[i] = vsum[g * 64 + i]; }
-    for (int i = tid; i < 1025; i += NTHR) S.lexp[i] = Lexp[i];
+    for (int i = tid; i < 1025; i += NTHR) S.lexp[i] = int(Lexp[i]);
     // Q A-fragments (rows rw*16 + gid, +8; 2 k-steps of 32 dims) for hi and lo, kept in registers
     uint32_t qa_hi[2][4], qa_lo[2][4];
     {
@@ -76,7 +86,7 @@ __global__ void __launch_bounds__(NTHR, 2) fused_attn_k(
             {   // K tile (and V tile in pass 2) -> smem, 16-byte chunks
                 const int4* sh = reinterpret_cast<const int4*>(khi + (size_t(g) * Tkp + k0) * 64); const int4* sl = reinterpret_cast<const int4*>(klo + (size_t(g) * Tkp + k0) * 64);
                 for (int i = tid; i < TK * 4; i += NTHR) { int key = i >> 2, c = i & 3; *reinterpret_cast<int4*>(S.khi + key * LD + c * 16) = sh[i]; *reinterpret_cast<int4*>(S.klo + key * LD + c * 16) = sl[i]; }
-                for (int i = tid; i < TK; i += NTHR) { S.ksum[i] = ksum[g * Tkp + k0 + i]; S.ek[i] = ek[g * Tkp + k0 + i]; }
+                for (int i = tid; i < TK; i += NTHR) { S.k128[i] = int(128LL * ksum[g * Tkp + k0 + i]); S.ek[i] = ek[g * Tkp + k0 + i]; }
                 if (pass == 2) for (int i = tid; i < 64 * 4; i += NTHR) {
                     int d = i >> 2, c = i & 3;
                     *reinterpret_cast<int4*>(S.vhi + d * LD + c * 16) = *reinterpret_cast<const int4*>(vthi + (size_t(g) * 64 + d) * Tkp + k0 + c * 16);
@@ -84,7 +94,10 @@ __global__ void __launch_bounds__(NTHR, 2) fused_attn_k(
                 }
             }
             __syncthreads();
-            const i64 cq0 = S.cq[row0], cq1 = S.cq[row1]; const int eq0 = S.eq[row0], eq1 = S.eq[row1];
+            const int cq0 = S.cq[row0], cq1 = S.cq[row1]; const int eq0 = S.eq[row0], eq1 = S.eq[row1];
+            const int mxr0 = pass ? S.mx[row0] : 0, mxr1 = pass ? S.mx[row1] : 0;
+            const i64 rr0 = pass == 2 ? S.r[row0] : 0, rr1 = pass == 2 ? S.r[row1] : 0;
+            const unsigned r0lo = unsigned(rr0), r0hi = unsigned(rr0 >> 32), r1lo = unsigned(rr1), r1hi = unsigned(rr1 >> 32);
             // scores: this warp -> n-tiles kh*4 .. kh*4+3 (8 keys each)
             for (int nt2 = 0; nt2 < 4; ++nt2) {
                 const int nt = kh * 4 + nt2, kb = nt * 8;             // local key base of this n-tile
@@ -95,25 +108,36 @@ __global__ void __launch_bounds__(NTHR, 2) fused_attn_k(
                     mma_s8(hh, qa_hi[ks], bh0, bh1); mma_s8(hl, qa_hi[ks], bl0, bl1); mma_s8(lh, qa_lo[ks], bh0, bh1); mma_s8(ll, qa_lo[ks], bl0, bl1);
                 }
                 // this thread's 4 elements: (row0, kb+t4*2), (row0, +1), (row1, kb+t4*2), (row1, +1)
-                int8_t ph[4], pl[4];
+                const int kl0 = kb + t4 * 2; const int key0 = k0 + kl0;
+                const int ekk[2] = {S.ek[kl0], S.ek[kl0 + 1]}; const int kk[2] = {S.k128[kl0], S.k128[kl0 + 1]};
+                int8_t ph[4], pl[4]; unsigned es0 = 0, es1 = 0; int phs_t = 0, pls_t = 0;
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    const int kl = kb + t4 * 2 + (j & 1), key = k0 + kl; const bool r1 = j >= 2;
-                    const int qrow = r1 ? qrow1 : qrow0; const int row = r1 ? row1 : row0;
-                    i64 Sx = 65536LL * hh[j] + 256LL * (i64(hl[j]) + lh[j]) + ll[j] + (r1 ? cq1 : cq0) + 128LL * S.ksum[kl];
+                    const int kc = j & 1, key = key0 + kc; const bool r1 = j >= 2;
+                    const int qrow = r1 ? qrow1 : qrow0;
+                    const int T = ((hl[j] + lh[j]) << 8) + ll[j] + (r1 ? cq1 : cq0) + kk[kc];
                     const bool valid = key < Tk && !(causal && key > qrow);
-                    const int s = valid ? int(rshr(Sx, 19 - (r1 ? eq1 : eq0) - S.ek[kl])) : INT_MIN;
-                    if (pass == 0) { if (r1) mx1 = max(mx1, s); else mx0 = max(mx0, s); }
+                    const int sv = valid ? score(hh[j], T, 19 - (r1 ? eq1 : eq0) - ekk[kc]) : INT_MIN;
+                    if (pass == 0) { if (r1) mx1 = max(mx1, sv); else mx0 = max(mx0, sv); }
                     else {
-                        const i64 E = valid ? lutexp(i64(S.mx[row]) - s, S.lexp) : 0;
-                        if (pass == 1) { if (r1) sum1 += E; else sum0 += E; }
+                        const unsigned z = valid ? unsigned(r1 ? mxr1 : mxr0) - unsigned(sv) : 0xffffffffu;
+                        const int E = lutexp32(z, S.lexp);
+                        if (pass == 1) { if (r1) es1 += unsigned(E); else es0 += unsigned(E); }
                         else {
-                            i64 P = 0; if (E > 0) { P = (E * S.r[row] + (1LL << 46)) >> 47; if (P > 32767) P = 32767; }
-                            split16(P, ph[j], pl[j]);
-                            if (r1) { phs1 += ph[j]; pls1 += pl[j]; } else { phs0 += ph[j]; pls0 += pl[j]; }
+                            int P = 0;
+                            if (E > 0) {
+                                const unsigned rlo = r1 ? r1lo : r0lo, rhi = r1 ? r1hi : r0hi;
+                                unsigned long long prod = (unsigned long long)unsigned(E) * rlo + ((unsigned long long)(unsigned(E) * rhi) << 32);
+                                prod = (prod + (1ull << 46)) >> 47; P = prod > 32767 ? 32767 : int(prod);
+                            }
+                            ph[j] = int8_t(P >> 8); pl[j] = int8_t((P & 255) - 128);
+                            phs_t += (r1 ? 0 : ph[j]); pls_t += (r1 ? 0 : pl[j]);
+                            if (r1) { phs1 += ph[j]; pls1 += pl[j]; }
                         }
                     }
                 }
+                if (pass == 1) { sum0 += es0; sum1 += es1; }
+                else if (pass == 2) { phs0 += phs_t; pls0 += pls_t; }
                 if (pass == 2) {
                     const int c = kb + t4 * 2;
                     *reinterpret_cast<uint16_t*>(S.phi + row0 * LD + c) = uint16_t(uint8_t(ph[0]) | (uint16_t(uint8_t(ph[1])) << 8));

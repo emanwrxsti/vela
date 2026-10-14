@@ -12,22 +12,27 @@
 
 namespace meow {
 namespace {
-constexpr int TQ = 64, TK = 64, NW = 8, NTHR = NW * 32, LD = 80;   // LD: smem row stride in bytes (bank-conflict free 4-byte fragment loads)
+constexpr int TQ = 64, TK = 64, NW = 8, NTHR = NW * 32, LD = 80, LDP = 64;   // LD: smem row stride in bytes (bank-conflict free 4-byte fragment loads)
 
 struct __align__(16) Smem {
     // ---- pass 0 ----
-    int8_t khi[TK * LD], klo[TK * LD];      // K tile  [key][dim]
-    int32_t k128[TK]; int32_t ek[TK];       // 128*ksum fits int32 (|ksum| <= 64*32767)
-    int32_t cq[TQ]; int32_t eq[TQ];         // 32768*qhs + 128*qls fits int32
+    int8_t khi[2][TK * LD], klo[2][TK * LD];   // K tile  [key][dim], double-buffered (cp.async)
+    i64 ksum[2][TK]; int32_t ek[2][TK];
+    int32_t cq[TQ]; int32_t eq[TQ];            // 32768*qhs + 128*qls fits int32
     int32_t mxh[2][TQ]; i64 sumh[2][TQ];
     // ---- pass 1 ----
-    int32_t lexp[1028];                     // exp LUT, values <= 2^30 (padded to keep 16-byte alignment below)
+    int32_t lexp[1028];                        // exp LUT, values <= 2^30 (padded to keep 16-byte alignment below)
     // ---- pass 2 ----
     __align__(16) int8_t vhi[64 * LD], vlo[64 * LD];      // V tile  [dim][key]
-    int8_t phi[TQ * LD], plo[TQ * LD];      // P tile  [query][key]
+    int8_t phi[TQ * LDP], plo[TQ * LDP];       // P tile  [query][key]
     i64 phsh[2][TQ], plsh[2][TQ];
     int32_t vev[64]; i64 vvsum[64];
 };
+__device__ __forceinline__ void cp16(void* sm, const void* gm) { unsigned sa = unsigned(__cvta_generic_to_shared(sm)); asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sa), "l"(gm)); }
+__device__ __forceinline__ void cp8(void* sm, const void* gm) { unsigned sa = unsigned(__cvta_generic_to_shared(sm)); asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" :: "r"(sa), "l"(gm)); }
+__device__ __forceinline__ void cp4(void* sm, const void* gm) { unsigned sa = unsigned(__cvta_generic_to_shared(sm)); asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(sa), "l"(gm)); }
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;"); }
+template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;" :: "n"(N)); }
 
 __device__ __forceinline__ void mma_s8(int32_t* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -89,20 +94,25 @@ __global__ void __launch_bounds__(NTHR, (PASS == 2 ? 2 : 3)) attn_pass_k(
     int mx0 = INT_MIN, mx1 = INT_MIN; i64 sum0 = 0, sum1 = 0, phs0 = 0, phs1 = 0, pls0 = 0, pls1 = 0;
     int32_t o_hh[4][4], o_mx[4][4], o_ll[4][4];
     if (PASS == 2) for (int n = 0; n < 4; ++n) for (int j = 0; j < 4; ++j) { o_hh[n][j] = 0; o_mx[n][j] = 0; o_ll[n][j] = 0; }
-    for (int kt = 0; kt < nTiles; ++kt) {
+    auto loadK = [&](int buf, int kt) {
         const int k0 = kt * TK;
-        __syncthreads();
-        {
-            const int4* sh = reinterpret_cast<const int4*>(khi + (size_t(g) * Tkp + k0) * 64); const int4* sl = reinterpret_cast<const int4*>(klo + (size_t(g) * Tkp + k0) * 64);
-            for (int i = tid; i < TK * 4; i += NTHR) { int key = i >> 2, c = i & 3; *reinterpret_cast<int4*>(S.khi + key * LD + c * 16) = sh[i]; *reinterpret_cast<int4*>(S.klo + key * LD + c * 16) = sl[i]; }
-            for (int i = tid; i < TK; i += NTHR) { S.k128[i] = int(128LL * ksum[g * Tkp + k0 + i]); S.ek[i] = ek[g * Tkp + k0 + i]; }
-            if (PASS == 2) for (int i = tid; i < 64 * 4; i += NTHR) {
-                int d = i >> 2, c = i & 3;
-                *reinterpret_cast<int4*>(S.vhi + d * LD + c * 16) = *reinterpret_cast<const int4*>(vthi + (size_t(g) * 64 + d) * Tkp + k0 + c * 16);
-                *reinterpret_cast<int4*>(S.vlo + d * LD + c * 16) = *reinterpret_cast<const int4*>(vtlo + (size_t(g) * 64 + d) * Tkp + k0 + c * 16);
-            }
-        }
-        __syncthreads();
+        const int8_t* sh = khi + (size_t(g) * Tkp + k0) * 64; const int8_t* sl = klo + (size_t(g) * Tkp + k0) * 64;
+        for (int i = tid; i < TK * 4; i += NTHR) { int key = i >> 2, c = i & 3; cp16(S.khi[buf] + key * LD + c * 16, sh + i * 16); cp16(S.klo[buf] + key * LD + c * 16, sl + i * 16); }
+        for (int i = tid; i < TK; i += NTHR) { cp8(&S.ksum[buf][i], ksum + g * Tkp + k0 + i); cp4(&S.ek[buf][i], ek + g * Tkp + k0 + i); }
+    };
+    auto loadV = [&](int kt) {
+        const int k0 = kt * TK;
+        for (int i = tid; i < 64 * 4; i += NTHR) { int d = i >> 2, c = i & 3; cp16(S.vhi + d * LD + c * 16, vthi + (size_t(g) * 64 + d) * Tkp + k0 + c * 16); cp16(S.vlo + d * LD + c * 16, vtlo + (size_t(g) * 64 + d) * Tkp + k0 + c * 16); }
+    };
+    loadK(0, 0); cp_commit();
+    for (int kt = 0; kt < nTiles; ++kt) {
+        const int k0 = kt * TK; const int buf = kt & 1;
+        cp_wait<0>();                                            // K(kt) landed
+        __syncthreads();                                         // ...and visible to all; everyone finished tile kt-1 (incl. its PV reads of V / P)
+        if (PASS == 2) { loadV(kt); cp_commit(); }               // V(kt): waited for right before the PV stage
+        if (kt + 1 < nTiles) { loadK(buf ^ 1, kt + 1); cp_commit(); }
+        const int8_t* Kh = S.khi[buf]; const int8_t* Kl = S.klo[buf]; const i64* Ks = S.ksum[buf]; const int32_t* Ke = S.ek[buf];
+        const bool fullTile = (k0 + TK <= Tk) && !causal;       // no per-element validity checks needed
         // scores: this warp -> n-tiles kh*4 .. kh*4+3 (8 keys each), two n-tiles per scalar block for ILP
         for (int np = 0; np < 2; ++np) {
             int32_t hh[2][4], hl[2][4], lh[2][4], ll[2][4];
@@ -111,7 +121,7 @@ __global__ void __launch_bounds__(NTHR, (PASS == 2 ? 2 : 3)) attn_pass_k(
                 const int nt = kh * 4 + np * 2 + u, kb = nt * 8;
                 for (int j = 0; j < 4; ++j) { hh[u][j] = 0; hl[u][j] = 0; lh[u][j] = 0; ll[u][j] = 0; }
                 for (int ks = 0; ks < 2; ++ks) {
-                    const int8_t* kh_p = S.khi + (kb + gid) * LD + ks * 32 + t4 * 4; const int8_t* kl_p = S.klo + (kb + gid) * LD + ks * 32 + t4 * 4;
+                    const int8_t* kh_p = Kh + (kb + gid) * LD + ks * 32 + t4 * 4; const int8_t* kl_p = Kl + (kb + gid) * LD + ks * 32 + t4 * 4;
                     uint32_t bh0 = ld32(kh_p), bh1 = ld32(kh_p + 16), bl0 = ld32(kl_p), bl1 = ld32(kl_p + 16);
                     mma_s8(hh[u], qa_hi[ks], bh0, bh1); mma_s8(hl[u], qa_hi[ks], bl0, bl1); mma_s8(lh[u], qa_lo[ks], bh0, bh1); mma_s8(ll[u], qa_lo[ks], bl0, bl1);
                 }
@@ -120,13 +130,13 @@ __global__ void __launch_bounds__(NTHR, (PASS == 2 ? 2 : 3)) attn_pass_k(
             for (int u = 0; u < 2; ++u) {
                 const int nt = kh * 4 + np * 2 + u, kb = nt * 8;
                 const int kl0 = kb + t4 * 2; const int key0 = k0 + kl0;
-                const int ekk[2] = {S.ek[kl0], S.ek[kl0 + 1]}; const int kk[2] = {S.k128[kl0], S.k128[kl0 + 1]};
+                const int ekk[2] = {Ke[kl0], Ke[kl0 + 1]}; const int kk[2] = {int(Ks[kl0] * 128), int(Ks[kl0 + 1] * 128)};
                 int8_t ph[4], pl[4]; unsigned es0 = 0, es1 = 0; int phs_t0 = 0, pls_t0 = 0, phs_t1 = 0, pls_t1 = 0;
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
                     const int kc = j & 1, key = key0 + kc; const bool r1 = j >= 2;
                     const int T = ((hl[u][j] + lh[u][j]) << 8) + ll[u][j] + (r1 ? cq1 : cq0) + kk[kc];
-                    const bool valid = key < Tk && !(causal && key > (r1 ? qrow1 : qrow0));
+                    const bool valid = fullTile || (key < Tk && !(causal && key > (r1 ? qrow1 : qrow0)));
                     const int sv = valid ? score(hh[u][j], T, 19 - (r1 ? eq1 : eq0) - ekk[kc]) : INT_MIN;
                     if (PASS == 0) { if (r1) mx1 = max(mx1, sv); else mx0 = max(mx0, sv); }
                     else {
@@ -146,19 +156,20 @@ __global__ void __launch_bounds__(NTHR, (PASS == 2 ? 2 : 3)) attn_pass_k(
                 else if (PASS == 2) {
                     phs0 += phs_t0; pls0 += pls_t0; phs1 += phs_t1; pls1 += pls_t1;
                     const int c = kb + t4 * 2;
-                    *reinterpret_cast<uint16_t*>(S.phi + row0 * LD + c) = uint16_t(uint8_t(ph[0]) | (uint16_t(uint8_t(ph[1])) << 8));
-                    *reinterpret_cast<uint16_t*>(S.plo + row0 * LD + c) = uint16_t(uint8_t(pl[0]) | (uint16_t(uint8_t(pl[1])) << 8));
-                    *reinterpret_cast<uint16_t*>(S.phi + row1 * LD + c) = uint16_t(uint8_t(ph[2]) | (uint16_t(uint8_t(ph[3])) << 8));
-                    *reinterpret_cast<uint16_t*>(S.plo + row1 * LD + c) = uint16_t(uint8_t(pl[2]) | (uint16_t(uint8_t(pl[3])) << 8));
+                    *reinterpret_cast<uint16_t*>(S.phi + row0 * LDP + c) = uint16_t(uint8_t(ph[0]) | (uint16_t(uint8_t(ph[1])) << 8));
+                    *reinterpret_cast<uint16_t*>(S.plo + row0 * LDP + c) = uint16_t(uint8_t(pl[0]) | (uint16_t(uint8_t(pl[1])) << 8));
+                    *reinterpret_cast<uint16_t*>(S.phi + row1 * LDP + c) = uint16_t(uint8_t(ph[2]) | (uint16_t(uint8_t(ph[3])) << 8));
+                    *reinterpret_cast<uint16_t*>(S.plo + row1 * LDP + c) = uint16_t(uint8_t(pl[2]) | (uint16_t(uint8_t(pl[3])) << 8));
                 }
             }
         }
         if (PASS == 2) {
-            __syncthreads();                                     // P tile complete
+            cp_wait<0>();                                        // V(kt) (and K(kt+1)) landed
+            __syncthreads();                                     // P tile complete, V visible
             for (int ks = 0; ks < 2; ++ks) {
                 const int c0 = ks * 32 + t4 * 4;
-                uint32_t pa_h[4] = {ld32(S.phi + row0 * LD + c0), ld32(S.phi + row1 * LD + c0), ld32(S.phi + row0 * LD + c0 + 16), ld32(S.phi + row1 * LD + c0 + 16)};
-                uint32_t pa_l[4] = {ld32(S.plo + row0 * LD + c0), ld32(S.plo + row1 * LD + c0), ld32(S.plo + row0 * LD + c0 + 16), ld32(S.plo + row1 * LD + c0 + 16)};
+                uint32_t pa_h[4] = {ld32(S.phi + row0 * LDP + c0), ld32(S.phi + row1 * LDP + c0), ld32(S.phi + row0 * LDP + c0 + 16), ld32(S.phi + row1 * LDP + c0 + 16)};
+                uint32_t pa_l[4] = {ld32(S.plo + row0 * LDP + c0), ld32(S.plo + row1 * LDP + c0), ld32(S.plo + row0 * LDP + c0 + 16), ld32(S.plo + row1 * LDP + c0 + 16)};
                 for (int nd = 0; nd < 4; ++nd) {
                     const int d = kh * 32 + nd * 8 + gid;
                     const int8_t* vh_p = S.vhi + d * LD + c0; const int8_t* vl_p = S.vlo + d * LD + c0;
@@ -168,6 +179,7 @@ __global__ void __launch_bounds__(NTHR, (PASS == 2 ? 2 : 3)) attn_pass_k(
             }
         }
     }
+    cp_wait<0>();
     __syncthreads();
     if (PASS == 0) {
         for (int o = 1; o < 4; o <<= 1) { mx0 = max(mx0, __shfl_xor_sync(0xffffffffu, mx0, o)); mx1 = max(mx1, __shfl_xor_sync(0xffffffffu, mx1, o)); }

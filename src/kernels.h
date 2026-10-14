@@ -60,12 +60,15 @@ void k_gn_apply_row(cudaStream_t st, const int32_t* X, int B, int T, int C, int 
                     int32_t* Y, uint32_t* pm, int8_t* hi, int8_t* lo, int32_t* e, int Kp);
 // a = sat32(rshr(a*gelu(g),16)) quantised per row
 void k_geglu_q(cudaStream_t st, const int32_t* A, const int32_t* G, int M, int C, const i64* Lphi, int8_t* hi, int8_t* lo, int32_t* e, int Kp);
-// 3x3 im2col with a precomputed pixel max (pm) — see k_im2col3
+// Epilogue of a merged GEMM whose N = parts*Cs: column n -> output Y[n / Cs][row][n % Cs] (up to 3 outputs).
+void k_epilogue_split(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int N, int ldc, const i64* wsum, const i64* m, const i64* s, const i64* b, const int32_t* e, int Cs, int32_t* Y0, int32_t* Y1, int32_t* Y2);
+// Epilogue of the merged GEGLU GEMM (N = 2F: [a | g]) fused with a = sat32(rshr(a*gelu(g),16)) and row quantisation -> hi/lo/e [*, Kp>=F].
+void k_epilogue_geglu_q(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int F, int ldc, const i64* wsum, const i64* m, const i64* s, const i64* b, const int32_t* e, const i64* Lphi, int8_t* hi, int8_t* lo, int32_t* eo, int Kp);
 }  // namespace meow
 namespace meow {
 // Fused exact attention on tensor cores (attn.cu). Tqp, Tkp multiples of 64; K/V operands from k_quant_heads / k_quant_v.
 void k_fused_attention(cudaStream_t st, const int8_t* qhi, const int8_t* qlo, const int32_t* eq, const i64* qhs, const i64* qls,
                        const int8_t* khi, const int8_t* klo, const int32_t* ek, const i64* ksum,
                        const int8_t* vthi, const int8_t* vtlo, const int32_t* ev, const i64* vsum,
-                       int B, int heads, int Tq, int Tqp, int Tk, int Tkp, bool causal, const i64* Lexp, int C, int32_t* out);
+                       int B, int heads, int Tq, int Tqp, int Tk, int Tkp, bool causal, const i64* Lexp, int C, int32_t* gmx, i64* gr, int32_t* out);
 }

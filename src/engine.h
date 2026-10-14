@@ -17,6 +17,8 @@ class DevModel {
 public:
     void load(int device, const Poisd& model);
     const Lin& lin(const std::string& n) const;
+    /** Row-concatenation of linears sharing K (N = ΣN_i), e.g. to_q|to_k|to_v, ff a|g; built once at load. */
+    void mergeLins(const std::string& name, const std::vector<std::string>& parts);
     const Norm& norm(const std::string& n) const;
     bool hasLin(const std::string& n) const { return lins_.count(n) != 0; }
     i64 *lutSigmoid = nullptr, *lutPhi = nullptr, *lutExp = nullptr, *lutGauss = nullptr, *tePos = nullptr, *tokM = nullptr, *tokS = nullptr;
@@ -82,6 +84,8 @@ private:
     QuantIn groupnormQ(const Tensor& x, const Norm& nm);
     Tensor groupnormSilu(const Tensor& x, const Norm& nm, u32*& pm);   // GN + SiLU + pixel max (for conv3)
     QuantIn gegluQ(const Tensor& a, const Tensor& g);
+    void linQ3(const QuantIn& q, const Lin& L, int Cs, Tensor& y0, Tensor& y1, Tensor& y2);   // merged GEMM, split epilogue
+    QuantIn linQGegluQ(const QuantIn& q, const Lin& L, int F);                                 // merged [a|g] GEMM + GEGLU + quant
     Tensor conv3(const Tensor& x, int H, int W, const Lin& L, int stride, int32_t* out = nullptr, const int32_t* residual = nullptr, const u32* pmIn = nullptr);
     Tensor groupnorm(const Tensor& x, const Norm& nm);
     Tensor layernorm(const Tensor& x, const Norm& nm);

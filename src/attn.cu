@@ -12,7 +12,10 @@
 
 namespace meow {
 namespace {
-constexpr int TQ = 64, TK = 64, NW = 8, NTHR = NW * 32, LD = 80, LDP = 64;   // LD: smem row stride in bytes (bank-conflict free 4-byte fragment loads)
+#ifndef MEOW_ATTN_TQ
+#define MEOW_ATTN_TQ 64
+#endif
+constexpr int TQ = MEOW_ATTN_TQ, TK = 64, RW = TQ / 16, NW = 2 * RW, NTHR = NW * 32, LD = 80, LDP = 64;   // RW row-groups of 16 queries x 2 key halves   // LD: smem row stride in bytes (bank-conflict free 4-byte fragment loads)
 
 struct __align__(16) Smem {
     // ---- pass 0 ----
@@ -71,7 +74,7 @@ __device__ __forceinline__ int lutexp32(unsigned z, const int32_t* L) {
 }
 
 template <int PASS>
-__global__ void __launch_bounds__(NTHR, (PASS == 2 ? 2 : 3)) attn_pass_k(
+__global__ void __launch_bounds__(NTHR, (TQ == 64 ? (PASS == 2 ? 2 : 3) : 1)) attn_pass_k(
     const int8_t* __restrict__ qhi, const int8_t* __restrict__ qlo, const int32_t* __restrict__ eq, const i64* __restrict__ qhs, const i64* __restrict__ qls,
     const int8_t* __restrict__ khi, const int8_t* __restrict__ klo, const int32_t* __restrict__ ek, const i64* __restrict__ ksum,
     const int8_t* __restrict__ vthi, const int8_t* __restrict__ vtlo, const int32_t* __restrict__ ev, const i64* __restrict__ vsum,
@@ -79,7 +82,7 @@ __global__ void __launch_bounds__(NTHR, (PASS == 2 ? 2 : 3)) attn_pass_k(
     extern __shared__ __align__(16) unsigned char smem_raw[];
     Smem& S = *reinterpret_cast<Smem*>(smem_raw);
     const int g = blockIdx.y, qt = blockIdx.x, q0 = qt * TQ;
-    const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31, rw = w & 3, kh = w >> 2;
+    const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31, rw = w % RW, kh = w / RW;
     const int gid = lane >> 2, t4 = lane & 3;
     const int lm = lane >> 3, lr = lane & 7;                       // ldmatrix: matrix index, row within matrix
     const int b = g / heads, h = g % heads;
@@ -105,7 +108,7 @@ __global__ void __launch_bounds__(NTHR, (PASS == 2 ? 2 : 3)) attn_pass_k(
     if (PASS >= 1) { mxr0 = gmx[rowBase + row0]; mxr1 = gmx[rowBase + row1]; }
     if (PASS == 2) { i64 rr0 = gr[rowBase + row0], rr1 = gr[rowBase + row1]; r0lo = unsigned(rr0); r0hi = unsigned(rr0 >> 32); r1lo = unsigned(rr1); r1hi = unsigned(rr1 >> 32); }
     // passes 0/1 may skip fully-masked tiles; pass 2 must include every key tile (the 128*vsum correction assumes all keys went through the MMA with P = 0 = (0,-128)).
-    const int nTiles = (PASS == 2 || !causal) ? Tkp / TK : min(Tkp / TK, qt + 1);
+    const int nTiles = (PASS == 2 || !causal) ? Tkp / TK : min(Tkp / TK, (qt + 1) * (TQ / TK));
     int mx0 = INT_MIN, mx1 = INT_MIN; i64 sum0 = 0, sum1 = 0, phs0 = 0, phs1 = 0, pls0 = 0, pls1 = 0;
     int32_t o_hh[4][4], o_mx[4][4], o_ll[4][4];
     if (PASS == 2) for (int n = 0; n < 4; ++n) for (int j = 0; j < 4; ++j) { o_hh[n][j] = 0; o_mx[n][j] = 0; o_ll[n][j] = 0; }
@@ -231,7 +234,7 @@ void k_fused_attention(cudaStream_t st, const int8_t* qhi, const int8_t* qlo, co
                        const int8_t* khi, const int8_t* klo, const int32_t* ek, const i64* ksum,
                        const int8_t* vthi, const int8_t* vtlo, const int32_t* ev, const i64* vsum,
                        int B, int heads, int Tq, int Tqp, int Tk, int Tkp, bool causal, const i64* Lexp, int C, int32_t* gmx, i64* gr, int32_t* out) {
-    if (Tqp % 64 || Tkp % 64) throw std::runtime_error("fused attention: Tqp/Tkp must be multiples of 64");
+    if (Tqp % TQ || Tkp % 64) throw std::runtime_error("fused attention: Tqp/Tkp alignment");
     static bool attrSet = false;
     if (!attrSet) {
         cudaFuncSetAttribute(attn_pass_k<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(SMEM0));
@@ -239,7 +242,7 @@ void k_fused_attention(cudaStream_t st, const int8_t* qhi, const int8_t* qlo, co
         cudaFuncSetAttribute(attn_pass_k<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(SMEM2));
         attrSet = true;
     }
-    dim3 grid(Tqp / 64, B * heads);
+    dim3 grid(Tqp / TQ, B * heads);
     attn_pass_k<0><<<grid, NTHR, SMEM0, st>>>(qhi, qlo, eq, qhs, qls, khi, klo, ek, ksum, vthi, vtlo, ev, vsum, Tq, Tqp, Tk, Tkp, causal, Lexp, heads, C, gmx, gr, out);
     attn_pass_k<1><<<grid, NTHR, SMEM1, st>>>(qhi, qlo, eq, qhs, qls, khi, klo, ek, ksum, vthi, vtlo, ev, vsum, Tq, Tqp, Tk, Tkp, causal, Lexp, heads, C, gmx, gr, out);
     attn_pass_k<2><<<grid, NTHR, SMEM2, st>>>(qhi, qlo, eq, qhs, qls, khi, klo, ek, ksum, vthi, vtlo, ev, vsum, Tq, Tqp, Tk, Tkp, causal, Lexp, heads, C, gmx, gr, out);

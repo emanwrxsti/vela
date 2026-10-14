@@ -274,7 +274,7 @@ AttnKV Engine::quantKV(const Tensor& k, const Tensor& v, int heads) {
 Tensor Engine::attention(const Tensor& q, const AttnKV& kv, int heads, bool causal, int Tq) {
     int B = q.B, C = q.C, G = B * heads, Tqp = int(align_up(q.T, 32));
     if (C != heads * 64) throw std::runtime_error("attention: C != heads*64");
-    if (cfg_.fusedAttention) Tqp = int(align_up(q.T, 64));
+    if (cfg_.fusedAttention) Tqp = int(align_up(q.T, 128));   // works for 64- and 128-query attention blocks
     Tensor out = talloc(B, q.T, C);
     size_t mk = arena_.mark();
     int8_t* qhi = (int8_t*)arena_.alloc(size_t(G) * Tqp * 64); int8_t* qlo = (int8_t*)arena_.alloc(size_t(G) * Tqp * 64);

@@ -30,7 +30,7 @@ if (Test-Path "$env:CUDA_PATH/installed-components.json") {
 $info = @{
     version = '0.1.0'; source_commit = (& git rev-parse HEAD).Trim()
     ci_run = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
-    platform = 'native-windows-x86_64'; cuda = '13.3'; architectures = @(80,86,89,120)
+    platform = 'native-windows-x86_64'; cuda = '13.3'; architectures = @(80,86,89,90,100,120)
     cpu_selftest = 'passed'; windows_gpu_hardware_test = $false
 }
 $info | ConvertTo-Json | Set-Content "$stage/BUILD-INFO.json"

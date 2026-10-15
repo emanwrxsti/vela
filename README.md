@@ -7,7 +7,7 @@ is a real inference, verified by the pool with the same engine in `--verify-serv
 * int8 tensor-core GEMMs through cuBLASLt (16-bit activations as a hi/lo int8 split with exact int64 reconstruction)
 * fused exact attention (`mma.sync` int8, 3-pass softmax, never materialises the score matrix)
 * exact integer GroupNorm / LayerNorm / LUT non-linearities, ChaCha20 noise on the GPU, CUDA Graphs, 2 lanes per GPU
-* Ampere (sm_80, e.g. CMP 170HX / A100 / 30xx), Ada (sm_89) and Blackwell consumer (sm_120, RTX 50xx) in one fatbin
+* one fatbin for Ampere (sm_80 CMP 170HX / A100 / 30xx, sm_86 A6000), Ada (sm_89), Hopper (sm_90 H100 / H200), Blackwell datacenter (sm_100 B200) and Blackwell consumer (sm_120 RTX 50xx / PRO 6000) — needs CUDA 13 to build the full set
 
 ## Download
 [GitHub Releases](https://github.com/ocminer/supr-meow-vela/releases) (and mirrored at https://vela.suprnova.cc/dl/):

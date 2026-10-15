@@ -19,6 +19,7 @@ struct AEpi {
     int epi = EPI_PLAIN; int32_t* Y = nullptr; int ldy = 0; const int32_t* residual = nullptr;
     int Cs = 0; int32_t* Y1 = nullptr; int32_t* Y2 = nullptr; const int32_t* Lphi = nullptr;
     uint32_t* rowmax = nullptr;              // optional: atomicMax of |y| per output row (feeds a SRC_X32 consumer)
+    void* gnstat = nullptr; int gnT = 0;     // optional (EPI_PLAIN, 64x64 tiles, Nreal % 32 == 0): accumulate GroupNorm sum/min/max per (sample, group) into GnStat[b*32+g]
     // EPI_QKV: N = 3*C, C = heads*64, rows = B*T. q -> (qhi,qlo,qe,qhs,qls,qts) with Tp = TpQ, k -> (khi,...) with Tp = TpK, v -> Y2 [rows, C]
     int heads = 0, T = 0, TpQ = 0, TpK = 0, C = 0;
     int8_t *qhi = nullptr, *qlo = nullptr, *khi = nullptr, *klo = nullptr; int32_t *qe = nullptr, *ke = nullptr; int64_t *qhs = nullptr, *qls = nullptr, *qts = nullptr, *khs = nullptr, *kls = nullptr, *kts = nullptr;

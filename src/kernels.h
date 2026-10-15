@@ -12,7 +12,8 @@ struct GnStat { i64 sum; int mn, mx; i64 mean; int e; i64 ss; i64 sd; };
 void k_quant_rows(cudaStream_t st, const int32_t* X, int M, int K, int ldx, int8_t* hi, int8_t* lo, int32_t* e, int Kp);
 // y[r,n] = sat32(rshr((256*Chi + Clo + 128*wsum[n]) * m[n], s[n] - e[r]) + b[n]); with residual R: y = sat32(R[r,n] + y) (R may alias Y)
 // cst[n] = {m, s, b, wsum} packed per output column.
-void k_epilogue(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int N, int ldc, const int4* cst, const int32_t* e, int32_t* Y, int ldy, const int32_t* residual = nullptr);
+void k_epilogue(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int N, int ldc, const int4* cst, const int32_t* e, int32_t* Y, int ldy, const int32_t* residual = nullptr,
+                GnStat* gs = nullptr, int T = 0);   // gs: accumulate per-(sample, group) sum/min/max of Y (32 groups, N % 32 == 0, (T*N) % 1024 == 0)
 // pm[b*T+p] = max_c |X[(b*T+p), c]|
 void k_pixmax(cudaStream_t st, const int32_t* X, int rows, int C, uint32_t* pm);
 // 3x3 (pad 1, stride) im2col with per-output-pixel quantisation: cols rows r = b*Ho*Wo + p, K index c*9+ky*3+kx.
@@ -20,6 +21,9 @@ void k_im2col3(cudaStream_t st, const int32_t* X, const uint32_t* pm, int B, int
                int8_t* hi, int8_t* lo, int32_t* e, int Kp);
 // GroupNorm on X[B, T, C] with `groups`: stats then apply (g/beta per channel, Q16).
 void k_gn_stats1(cudaStream_t st, const int32_t* X, int B, int T, int C, int groups, GnStat* gs);
+// Producer-side GroupNorm statistics: init (sum 0, mn INT_MAX, mx INT_MIN) then the producers atomically accumulate; fin1 computes mean/e.
+void k_gn_init(cudaStream_t st, GnStat* gs, int cnt);
+void k_gn_fin1(cudaStream_t st, GnStat* gs, int cnt, i64 n);
 void k_gn_stats2(cudaStream_t st, const int32_t* X, int B, int T, int C, int groups, i64 den, GnStat* gs);
 void k_gn_apply(cudaStream_t st, const int32_t* X, int B, int T, int C, int groups, const GnStat* gs, const i64* g, const i64* beta, int32_t* Y);
 // LayerNorm over rows of X[M, C]
@@ -27,7 +31,7 @@ void k_lnorm(cudaStream_t st, const int32_t* X, int M, int C, const i64* g, cons
 void k_act(cudaStream_t st, int32_t* X, size_t n, const int32_t* L);                     // x = sat32(rshr(x*lut(x),16)) in place
 void k_geglu(cudaStream_t st, int32_t* A, const int32_t* G, size_t n, const int32_t* Lphi); // a = sat32(rshr(a*gelu(g),16))
 void k_add(cudaStream_t st, int32_t* X, const int32_t* Y, size_t n);                  // x = sat32(x+y)
-void k_concat(cudaStream_t st, const int32_t* A, int Ca, const int32_t* B, int Cb, int rows, int32_t* out);
+void k_concat(cudaStream_t st, const int32_t* A, int Ca, const int32_t* B, int Cb, int rows, int32_t* out, GnStat* gs = nullptr, int T = 0);
 void k_upsample2(cudaStream_t st, const int32_t* X, int B, int H, int W, int C, int32_t* out);
 // ChaCha20(seed) keystream -> uint16 -> gauss LUT -> n (channel-major int32 [B,4,4096]) and x = rshr(n*cin,30) (NHWC [B,4096,4]).
 void k_noise(cudaStream_t st, const uint8_t* seeds, int B, const i64* gauss, i64 cin, int32_t* n, int32_t* x);

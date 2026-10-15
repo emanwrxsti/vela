@@ -60,18 +60,38 @@ __device__ __forceinline__ int epi1(const int32_t* __restrict__ Chi, const int32
     i64 acc = 256LL * Chi[ci] + Clo[ci] + 128LL * c.w;
     return int(sat32(rshr(acc * c.x, c.y - er) + c.z));
 }
+/** Block-level accumulation of GroupNorm sum/min/max into gs[b*32 + g]. Call with per-thread (value, group) items; all items of a block belong to sample b. */
+struct GnAccSm { i64 sum[32]; int mn[32]; int mx[32]; };
+__device__ __forceinline__ void gnacc_init(GnAccSm& a) { if (threadIdx.x < 32) { a.sum[threadIdx.x] = 0; a.mn[threadIdx.x] = INT_MAX; a.mx[threadIdx.x] = INT_MIN; } }
+__device__ __forceinline__ void gnacc_add(GnAccSm& a, int g, int v) { atomicAdd((unsigned long long*)&a.sum[g], (unsigned long long)(i64)v); atomicMin(&a.mn[g], v); atomicMax(&a.mx[g], v); }
+__device__ __forceinline__ void gnacc_flush(GnAccSm& a, GnStat* gs, int b) {
+    if (threadIdx.x < 32 && a.mn[threadIdx.x] != INT_MAX) { GnStat* s = gs + b * 32 + threadIdx.x; atomicAdd((unsigned long long*)&s->sum, (unsigned long long)a.sum[threadIdx.x]); atomicMin(&s->mn, a.mn[threadIdx.x]); atomicMax(&s->mx, a.mx[threadIdx.x]); }
+}
 // 4 consecutive columns per thread (N % 4 == 0, ldc/ldy % 4 == 0): one int4 load per plane, one int4 store.
+template <bool GN>
 __global__ void epilogue_k(const int32_t* __restrict__ Chi, const int32_t* __restrict__ Clo, int M, int N, int ldc, const int4* __restrict__ cst,
-                           const int32_t* __restrict__ e, int32_t* __restrict__ Y, int ldy, const int32_t* R) {
+                           const int32_t* __restrict__ e, int32_t* __restrict__ Y, int ldy, const int32_t* R, GnStat* gs, int T) {
+    __shared__ GnAccSm acc;
     const int tpr = N >> 2;
     const size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= size_t(M) * tpr) return;
-    const int r = int(idx / tpr), n = int(idx - size_t(r) * tpr) * 4;
-    const int er = e[r];
-    const int4 h = *reinterpret_cast<const int4*>(Chi + size_t(r) * ldc + n), l = *reinterpret_cast<const int4*>(Clo + size_t(r) * ldc + n);
-    int4 y; y.x = epi1v(h.x, l.x, cst[n], er); y.y = epi1v(h.y, l.y, cst[n + 1], er); y.z = epi1v(h.z, l.z, cst[n + 2], er); y.w = epi1v(h.w, l.w, cst[n + 3], er);
-    if (R) { const int4 rr = *reinterpret_cast<const int4*>(R + size_t(r) * ldy + n); y.x = int(sat32(i64(y.x) + rr.x)); y.y = int(sat32(i64(y.y) + rr.y)); y.z = int(sat32(i64(y.z) + rr.z)); y.w = int(sat32(i64(y.w) + rr.w)); }
-    *reinterpret_cast<int4*>(Y + size_t(r) * ldy + n) = y;
+    const bool live = idx < size_t(M) * tpr;
+    if (GN) { gnacc_init(acc); __syncthreads(); }
+    int r = 0, n = 0; int4 y = make_int4(0, 0, 0, 0);
+    if (live) {
+        r = int(idx / tpr); n = int(idx - size_t(r) * tpr) * 4;
+        const int er = e[r];
+        const int4 h = *reinterpret_cast<const int4*>(Chi + size_t(r) * ldc + n), l = *reinterpret_cast<const int4*>(Clo + size_t(r) * ldc + n);
+        y.x = epi1v(h.x, l.x, cst[n], er); y.y = epi1v(h.y, l.y, cst[n + 1], er); y.z = epi1v(h.z, l.z, cst[n + 2], er); y.w = epi1v(h.w, l.w, cst[n + 3], er);
+        if (R) { const int4 rr = *reinterpret_cast<const int4*>(R + size_t(r) * ldy + n); y.x = int(sat32(i64(y.x) + rr.x)); y.y = int(sat32(i64(y.y) + rr.y)); y.z = int(sat32(i64(y.z) + rr.z)); y.w = int(sat32(i64(y.w) + rr.w)); }
+        *reinterpret_cast<int4*>(Y + size_t(r) * ldy + n) = y;
+    }
+    if (GN) {
+        const int cg = N >> 5;
+        if (live) { gnacc_add(acc, n / cg, y.x); gnacc_add(acc, (n + 1) / cg, y.y); gnacc_add(acc, (n + 2) / cg, y.z); gnacc_add(acc, (n + 3) / cg, y.w); }
+        __syncthreads();
+        const int b = int((size_t(blockIdx.x) * blockDim.x / tpr) / T);     // all elements of a block are in one sample
+        gnacc_flush(acc, gs, b);
+    }
 }
 
 // Epilogue of a merged GEMM whose N = parts*Cs: column n -> Y[n / Cs][row][n % Cs]
@@ -406,10 +426,18 @@ __global__ void geglu_k(int32_t* A, const int32_t* __restrict__ G, size_t n, con
     A[i] = int32_t(sat32(rshr(i64(A[i]) * ge, 16)));
 }
 __global__ void add_k(int32_t* X, const int32_t* __restrict__ Y, size_t n) { size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; if (i < n) X[i] = int32_t(sat32(i64(X[i]) + Y[i])); }
-__global__ void concat_k(const int32_t* __restrict__ A, int Ca, const int32_t* __restrict__ Bm, int Cb, int rows, int32_t* __restrict__ out) {
-    int Co = Ca + Cb; size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; if (i >= size_t(rows) * Co) return;
-    size_t r = i / Co; int c = int(i % Co);
-    out[i] = c < Ca ? A[r * Ca + c] : Bm[r * Cb + (c - Ca)];
+template <bool GN>
+__global__ void concat_k(const int32_t* __restrict__ A, int Ca, const int32_t* __restrict__ Bm, int Cb, int rows, int32_t* __restrict__ out, GnStat* gs, int T) {
+    __shared__ GnAccSm acc;
+    int Co = Ca + Cb; size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; const bool live = i < size_t(rows) * Co;
+    if (GN) { gnacc_init(acc); __syncthreads(); }
+    int v = 0, c = 0;
+    if (live) { size_t r = i / Co; c = int(i % Co); v = c < Ca ? A[r * Ca + c] : Bm[r * Cb + (c - Ca)]; out[i] = v; }
+    if (GN) {
+        if (live) gnacc_add(acc, c / (Co >> 5), v);
+        __syncthreads();
+        gnacc_flush(acc, gs, int((size_t(blockIdx.x) * blockDim.x / Co) / T));
+    }
 }
 __global__ void upsample2_k(const int32_t* __restrict__ X, int B, int H, int W, int C, int32_t* __restrict__ out) {
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; size_t tot = size_t(B) * 4 * H * W * C; if (i >= tot) return;
@@ -586,10 +614,13 @@ void k_quant_rows(cudaStream_t st, const int32_t* X, int M, int K, int ldx, int8
     if (K <= 1280 && K % 4 == 0 && ldx % 4 == 0) WARPDISPATCH(K, quant_rows_w_k, unsigned((Mp + 7) / 8), X, M, K, ldx, hi, lo, e, Kp);
     else quant_rows_k<<<Mp, NT, 0, st>>>(X, M, K, ldx, hi, lo, e, Kp);
 }
-void k_epilogue(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int N, int ldc, const int4* cst, const int32_t* e, int32_t* Y, int ldy, const int32_t* residual) {
+void k_epilogue(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int N, int ldc, const int4* cst, const int32_t* e, int32_t* Y, int ldy, const int32_t* residual, GnStat* gs, int T) {
     if (N % 4 || ldc % 4 || ldy % 4) throw std::runtime_error("epilogue: N/ld must be multiples of 4");
-    epilogue_k<<<gridFor(size_t(M) * (N / 4)), NT, 0, st>>>(Chi, Clo, M, N, ldc, cst, e, Y, ldy, residual);
+    if (gs) { if (N % 32 || (size_t(T) * N) % 1024 || ldy != N) throw std::runtime_error("epilogue GN stats: shape"); epilogue_k<true><<<gridFor(size_t(M) * (N / 4)), NT, 0, st>>>(Chi, Clo, M, N, ldc, cst, e, Y, ldy, residual, gs, T); }
+    else epilogue_k<false><<<gridFor(size_t(M) * (N / 4)), NT, 0, st>>>(Chi, Clo, M, N, ldc, cst, e, Y, ldy, residual, nullptr, 0);
 }
+void k_gn_init(cudaStream_t st, GnStat* gs, int cnt) { gn_init_k<<<gridFor(cnt), NT, 0, st>>>(gs, cnt); }
+void k_gn_fin1(cudaStream_t st, GnStat* gs, int cnt, i64 n) { gn_fin1_k<<<gridFor(cnt), NT, 0, st>>>(gs, cnt, n); }
 void k_pixmax(cudaStream_t st, const int32_t* X, int rows, int C, uint32_t* pm) { pixmax_k<<<gridFor(size_t(rows) * 32), NT, 0, st>>>(X, rows, C, pm); }
 void k_im2col3(cudaStream_t st, const int32_t* X, const uint32_t* pm, int B, int H, int W, int C, int stride, int8_t* hi, int8_t* lo, int32_t* e, int Kp) {
     int Ho = (H - 1) / stride + 1, Wo = (W - 1) / stride + 1; int rows = B * Ho * Wo; int Mp = (rows + 31) / 32 * 32;
@@ -617,7 +648,11 @@ void k_lnorm(cudaStream_t st, const int32_t* X, int M, int C, const i64* g, cons
 void k_act(cudaStream_t st, int32_t* X, size_t n, const int32_t* L) { act_k<<<gridFor(n), NT, 0, st>>>(X, n, L); }
 void k_geglu(cudaStream_t st, int32_t* A, const int32_t* G, size_t n, const int32_t* L) { geglu_k<<<gridFor(n), NT, 0, st>>>(A, G, n, L); }
 void k_add(cudaStream_t st, int32_t* X, const int32_t* Y, size_t n) { add_k<<<gridFor(n), NT, 0, st>>>(X, Y, n); }
-void k_concat(cudaStream_t st, const int32_t* A, int Ca, const int32_t* B, int Cb, int rows, int32_t* out) { concat_k<<<gridFor(size_t(rows) * (Ca + Cb)), NT, 0, st>>>(A, Ca, B, Cb, rows, out); }
+void k_concat(cudaStream_t st, const int32_t* A, int Ca, const int32_t* B, int Cb, int rows, int32_t* out, GnStat* gs, int T) {
+    const int Co = Ca + Cb;
+    if (gs) { if (Co % 32 || (size_t(T) * Co) % NT) throw std::runtime_error("concat GN stats: shape"); concat_k<true><<<gridFor(size_t(rows) * Co), NT, 0, st>>>(A, Ca, B, Cb, rows, out, gs, T); }
+    else concat_k<false><<<gridFor(size_t(rows) * Co), NT, 0, st>>>(A, Ca, B, Cb, rows, out, nullptr, 0);
+}
 void k_upsample2(cudaStream_t st, const int32_t* X, int B, int H, int W, int C, int32_t* out) { upsample2_k<<<gridFor(size_t(B) * 4 * H * W * C), NT, 0, st>>>(X, B, H, W, C, out); }
 void k_noise(cudaStream_t st, const uint8_t* seeds, int B, const i64* gauss, i64 cin, int32_t* n, int32_t* x) { noise_k<<<dim3(2, B), NT, 0, st>>>(seeds, gauss, cin, n, x); }
 void k_finalize(cudaStream_t st, const int32_t* n, const int32_t* eps, int B, i64 sig, uint8_t* out) { finalize_k<<<gridFor(size_t(B) * 16384), NT, 0, st>>>(n, eps, B, sig, out); }

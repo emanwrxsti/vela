@@ -154,8 +154,9 @@ Tensor Engine::linQ(const QuantIn& q, const Lin& L, int32_t* out, const int32_t*
     arena_.release(mk);
     return y;
 }
+GnStat* Engine::gnAlloc(int B) { GnStat* g = (GnStat*)arena_.alloc(sizeof(GnStat) * B * 32); k_gn_init(st_, g, B * 32); return g; }
 uint32_t* Engine::rowmaxAlloc(int rows) { uint32_t* p = (uint32_t*)arena_.alloc(size_t(rows) * 4); cudaMemsetAsync(p, 0, size_t(rows) * 4, st_); return p; }
-Tensor Engine::linX(const Tensor& x, const Lin& L, int32_t* out, const int32_t* residual, int epi, bool wantRowmax) {
+Tensor Engine::linX(const Tensor& x, const Lin& L, int32_t* out, const int32_t* residual, int epi, bool wantRowmax, GnStat* gnOut) {
     if (!(cfg_.fusedLoader && x.rowmax && useHl(L) && L.K % 16 == 0)) {
         if (epi == EPI_GELU) { Tensor y = lin(x, L, out, residual); k_act(st_, y.d, y.n(), dm_.lutPhi32); if (wantRowmax) { QuantIn dummy; (void)dummy; } return y; }
         return lin(x, L, out, residual);
@@ -163,8 +164,9 @@ Tensor Engine::linX(const Tensor& x, const Lin& L, int32_t* out, const int32_t* 
     int rows = x.B * x.T, Mp = int(align_up(rows, 64));
     Tensor y; y.B = x.B; y.T = x.T; y.C = L.N; y.d = out ? out : (int32_t*)arena_.alloc(y.n() * 4);
     if (wantRowmax) y.rowmax = rowmaxAlloc(rows);
+    if (gnOut && epi == EPI_PLAIN && gnFusable(x.T, L.N)) y.gnst = gnOut;
     ASrc A; A.src = SRC_X32; A.x = x.d; A.ldx = x.C; A.rowmax = x.rowmax; A.K = L.K;
-    AEpi E; E.epi = epi; E.Y = y.d; E.ldy = L.N; E.residual = residual; E.Lphi = dm_.lutPhi32; E.rowmax = y.rowmax;
+    AEpi E; E.epi = epi; E.Y = y.d; E.ldy = L.N; E.residual = residual; E.Lphi = dm_.lutPhi32; E.rowmax = y.rowmax; E.gnstat = y.gnst; E.gnT = x.T;
     k_gemm_hl2(st_, A, Mp, rows, L.w, L.Kp, L.Np, L.N, L.Kp, L.cst, E);
     return y;
 }
@@ -227,8 +229,8 @@ QuantIn Engine::groupnormQ(const Tensor& x, const Norm& nm) {
     if (nm.C != x.C) throw std::runtime_error("groupnormQ: C mismatch");
     QuantIn q = qalloc(x.B, x.T, x.C);
     size_t mk = arena_.mark();
-    GnStat* gs = (GnStat*)arena_.alloc(sizeof(GnStat) * x.B * 32);
-    k_gn_stats1(st_, x.d, x.B, x.T, x.C, 32, gs);
+    GnStat* gs = x.gnst;
+    if (gs) k_gn_fin1(st_, gs, x.B * 32, i64(x.T) * (x.C / 32)); else { gs = (GnStat*)arena_.alloc(sizeof(GnStat) * x.B * 32); k_gn_stats1(st_, x.d, x.B, x.T, x.C, 32, gs); }
     k_gn_stats2(st_, x.d, x.B, x.T, x.C, 32, nm.den, gs);
     k_gn_apply_row(st_, x.d, x.B, x.T, x.C, 32, gs, nm.g32, nm.beta32, nullptr, nullptr, nullptr, q.hi, q.lo, q.e, q.Kp);
     arena_.release(mk);
@@ -239,17 +241,18 @@ Tensor Engine::groupnormSilu(const Tensor& x, const Norm& nm, u32*& pm) {
     Tensor y = talloc(x.B, x.T, x.C);
     pm = (u32*)arena_.alloc(size_t(x.B) * x.T * 4);
     size_t mk = arena_.mark();
-    GnStat* gs = (GnStat*)arena_.alloc(sizeof(GnStat) * x.B * 32);
-    k_gn_stats1(st_, x.d, x.B, x.T, x.C, 32, gs);
+    GnStat* gs = x.gnst;
+    if (gs) k_gn_fin1(st_, gs, x.B * 32, i64(x.T) * (x.C / 32)); else { gs = (GnStat*)arena_.alloc(sizeof(GnStat) * x.B * 32); k_gn_stats1(st_, x.d, x.B, x.T, x.C, 32, gs); }
     k_gn_stats2(st_, x.d, x.B, x.T, x.C, 32, nm.den, gs);
     k_gn_apply_row(st_, x.d, x.B, x.T, x.C, 32, gs, nm.g32, nm.beta32, dm_.lutSigmoid32, y.d, pm, nullptr, nullptr, nullptr, 0);
     arena_.release(mk);
     return y;
 }
-Tensor Engine::conv3(const Tensor& x, int H, int W, const Lin& L, int stride, int32_t* out, const int32_t* residual, const u32* pmIn) {
+Tensor Engine::conv3(const Tensor& x, int H, int W, const Lin& L, int stride, int32_t* out, const int32_t* residual, const u32* pmIn, GnStat* gnOut) {
     if (!L.conv3 || x.C * 9 != L.K) throw std::runtime_error("conv3: shape mismatch");
     int Ho = (H - 1) / stride + 1, Wo = (W - 1) / stride + 1; int rows = x.B * Ho * Wo, Mp = int(align_up(rows, 64));
     Tensor y; y.B = x.B; y.T = Ho * Wo; y.C = L.N; y.d = out ? out : (int32_t*)arena_.alloc(y.n() * 4);
+    if (gnOut && gnFusable(y.T, L.N)) y.gnst = gnOut;
     size_t mk = arena_.mark();
     u32* pm = const_cast<u32*>(pmIn);
     if (!pm) { pm = (u32*)arena_.alloc(size_t(x.B) * H * W * 4); k_pixmax(st_, x.d, x.B * H * W, x.C, pm); }
@@ -257,17 +260,18 @@ Tensor Engine::conv3(const Tensor& x, int H, int W, const Lin& L, int stride, in
     if (cfg_.fusedLoader && useHl(L) && x.C % 16 == 0) {           // implicit im2col inside the GEMM (no int8 planes)
         k_conv_e(st_, pm, x.B, H, W, stride, e);
         ASrc A; A.src = SRC_CONV32; A.img = x.d; A.H = H; A.W = W; A.C = x.C; A.stride = stride; A.Ho = Ho; A.Wo = Wo; A.K = L.K; A.e = e;
-        AEpi E; E.epi = EPI_PLAIN; E.Y = y.d; E.ldy = L.N; E.residual = residual;
+        AEpi E; E.epi = EPI_PLAIN; E.Y = y.d; E.ldy = L.N; E.residual = residual; E.gnstat = y.gnst; E.gnT = y.T;
         k_gemm_hl2(st_, A, Mp, rows, L.w, L.Kp, L.Np, L.N, L.Kp, L.cst, E);
         arena_.release(mk);
         return y;
     }
     int8_t* hi = (int8_t*)arena_.alloc(size_t(2) * Mp * L.Kp); int8_t* lo = hi + size_t(Mp) * L.Kp;
     k_im2col3(st_, x.d, pm, x.B, H, W, x.C, stride, hi, lo, e, L.Kp);
-    if (useHl(L)) { k_gemm_hl(st_, hi, lo, L.Kp, Mp, rows, L.w, L.Kp, L.Np, L.N, L.Kp, L.cst, e, y.d, L.N, residual); arena_.release(mk); return y; }
+    if (useHl(L)) { ASrc A; A.src = SRC_I8; A.hi = hi; A.lo = lo; A.ld8 = L.Kp; A.e = e; AEpi E; E.epi = EPI_PLAIN; E.Y = y.d; E.ldy = L.N; E.residual = residual; E.gnstat = y.gnst; E.gnT = y.T;
+                   k_gemm_hl2(st_, A, Mp, rows, L.w, L.Kp, L.Np, L.N, L.Kp, L.cst, E); arena_.release(mk); return y; }
     int32_t* Chi = (int32_t*)arena_.alloc(size_t(2) * Mp * L.Np * 4); int32_t* Clo = Chi + size_t(Mp) * L.Np;
     gemm_.run(st_, hi, L.Kp, 0, L.w, L.Kp, 0, Chi, L.Np, 0, 2 * Mp, L.Np, L.Kp);
-    k_epilogue(st_, Chi, Clo, rows, L.N, L.Np, L.cst, e, y.d, L.N, residual);
+    k_epilogue(st_, Chi, Clo, rows, L.N, L.Np, L.cst, e, y.d, L.N, residual, y.gnst, y.T);
     arena_.release(mk);
     return y;
 }
@@ -382,18 +386,23 @@ Tensor Engine::attention(const Tensor& q, const AttnKV& kv, int heads, bool caus
 Tensor Engine::resnet(const Tensor& x, int H, int W, const std::string& p) {
     const Lin& c1 = dm_.lin(p + ".conv1"); const Lin& c2 = dm_.lin(p + ".conv2");
     Tensor out = talloc(x.B, x.T, c2.N);
+    GnStat* gOut = gnFusable(out.T, out.C) ? gnAlloc(out.B) : nullptr;       // lives with `out`
     size_t mk = arena_.mark();
     u32* pm1 = nullptr; u32* pm2 = nullptr;
     Tensor h = groupnormSilu(x, dm_.norm(p + ".norm1"), pm1);
-    h = conv3(h, H, W, c1, 1, nullptr, nullptr, pm1);
+    GnStat* g1 = gnFusable(h.T, c1.N) ? gnAlloc(h.B) : nullptr;
+    h = conv3(h, H, W, c1, 1, nullptr, nullptr, pm1, g1);
     Tensor h2 = groupnormSilu(h, dm_.norm(p + ".norm2"), pm2);
-    if (dm_.hasLin(p + ".conv_shortcut")) { Tensor xs = lin(x, dm_.lin(p + ".conv_shortcut")); conv3(h2, H, W, c2, 1, out.d, xs.d, pm2); }
-    else conv3(h2, H, W, c2, 1, out.d, x.d, pm2);
+    Tensor o;
+    if (dm_.hasLin(p + ".conv_shortcut")) { Tensor xs = lin(x, dm_.lin(p + ".conv_shortcut")); o = conv3(h2, H, W, c2, 1, out.d, xs.d, pm2, gOut); }
+    else o = conv3(h2, H, W, c2, 1, out.d, x.d, pm2, gOut);
+    out.gnst = o.gnst;
     arena_.release(mk);
     return out;
 }
 Tensor Engine::transformer(const Tensor& x, const std::string& p, int heads) {
     Tensor out = talloc(x.B, x.T, x.C);
+    GnStat* gOut = gnFusable(out.T, out.C) ? gnAlloc(out.B) : nullptr;
     size_t mk = arena_.mark();
     std::string b = p + ".transformer_blocks.0";
     Tensor h = talloc(x.B, x.T, dm_.lin(p + ".proj_in").N);
@@ -436,14 +445,14 @@ Tensor Engine::transformer(const Tensor& x, const std::string& p, int heads) {
         else { QuantIn aq = linQGegluQ(n, dm_.lin(b + ".ff.net.0.proj.ag"), F, &Li); linQ(aq, dm_.lin(b + ".ff.net.2"), h.d, h.d); }
         arena_.release(m2);
     }
-    linX(h, dm_.lin(p + ".proj_out"), out.d, x.d);
+    { Tensor o = linX(h, dm_.lin(p + ".proj_out"), out.d, x.d, EPI_PLAIN, false, gOut); out.gnst = o.gnst; }
     arena_.release(mk);
     return out;
 }
 void Engine::unet(const Tensor& x, Tensor& eps) {
     static const int HEADS[4] = {5, 10, 20, 20};
     int H = 64, W = 64;
-    Tensor h = conv3(x, H, W, dm_.lin("unet.conv_in"), 1);
+    Tensor h = conv3(x, H, W, dm_.lin("unet.conv_in"), 1, nullptr, nullptr, nullptr, gnFusable(x.T, dm_.lin("unet.conv_in").N) ? gnAlloc(x.B) : nullptr);
     std::vector<Tensor> skips; skips.push_back(h);
     for (int i = 0; i < 4; ++i) {
         for (int j = 0; j < 2; ++j) {
@@ -451,7 +460,8 @@ void Engine::unet(const Tensor& x, Tensor& eps) {
             if (i < 3) h = transformer(h, "unet.down_blocks." + std::to_string(i) + ".attentions." + std::to_string(j), HEADS[i]);
             skips.push_back(h);
         }
-        if (i < 3) { h = conv3(h, H, W, dm_.lin("unet.down_blocks." + std::to_string(i) + ".downsamplers.0.conv"), 2); H /= 2; W /= 2; skips.push_back(h); }
+        if (i < 3) { const Lin& Ld = dm_.lin("unet.down_blocks." + std::to_string(i) + ".downsamplers.0.conv"); const int To = (H / 2) * (W / 2);
+                     h = conv3(h, H, W, Ld, 2, nullptr, nullptr, nullptr, gnFusable(To, Ld.N) ? gnAlloc(h.B) : nullptr); H /= 2; W /= 2; skips.push_back(h); }
     }
     h = resnet(h, H, W, "unet.mid_block.resnets.0");
     h = transformer(h, "unet.mid_block.attentions.0", 20);
@@ -460,14 +470,15 @@ void Engine::unet(const Tensor& x, Tensor& eps) {
         for (int j = 0; j < 3; ++j) {
             Tensor s = skips.back(); skips.pop_back();
             Tensor c = talloc(h.B, h.T, h.C + s.C);
-            k_concat(st_, h.d, h.C, s.d, s.C, h.B * h.T, c.d);
+            c.gnst = (cfg_.gnFuse && cfg_.fusedLoader && c.C % 32 == 0 && (size_t(c.T) * c.C) % 256 == 0) ? gnAlloc(c.B) : nullptr;
+            k_concat(st_, h.d, h.C, s.d, s.C, h.B * h.T, c.d, c.gnst, c.T);
             h = resnet(c, H, W, "unet.up_blocks." + std::to_string(i) + ".resnets." + std::to_string(j));
             if (i > 0) h = transformer(h, "unet.up_blocks." + std::to_string(i) + ".attentions." + std::to_string(j), HEADS[3 - i]);
         }
         if (i < 3) {
             Tensor u = talloc(h.B, h.T * 4, h.C);
             k_upsample2(st_, h.d, h.B, H, W, h.C, u.d); H *= 2; W *= 2;
-            h = conv3(u, H, W, dm_.lin("unet.up_blocks." + std::to_string(i) + ".upsamplers.0.conv"), 1);
+            { const Lin& Lu = dm_.lin("unet.up_blocks." + std::to_string(i) + ".upsamplers.0.conv"); h = conv3(u, H, W, Lu, 1, nullptr, nullptr, nullptr, gnFusable(u.T, Lu.N) ? gnAlloc(u.B) : nullptr); }
         }
     }
     u32* pmo = nullptr;

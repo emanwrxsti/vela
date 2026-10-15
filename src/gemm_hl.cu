@@ -1,6 +1,8 @@
 #include "gemm_hl.h"
 #include "intops.cuh"
+#include "kernels.h"
 #include <cstdint>
+#include <climits>
 #include <stdexcept>
 
 namespace meow {
@@ -154,6 +156,9 @@ __global__ void __launch_bounds__(NTHR) gemm_hl_k(const ASrc A, int Mreal, const
     };
     for (int kt = 0; kt < nK; kt += 2) { step(kt, raw0); if (kt + 1 < nK) step(kt + 1, raw1); }
     cp_wait<0>();
+    // optional GroupNorm statistics of the output (EPI_PLAIN): block tile = 64 rows of one sample x 64 columns
+    GnStat* gnst = static_cast<GnStat*>(E.gnstat); int* gnsm = nullptr;
+    if (EPI == EPI_PLAIN && gnst) { __syncthreads(); gnsm = reinterpret_cast<int*>(smem); if (tid < 32) { reinterpret_cast<i64*>(gnsm)[tid] = 0; gnsm[64 + tid] = INT_MAX; gnsm[96 + tid] = INT_MIN; } __syncthreads(); }
     int32_t* __restrict__ Y = E.Y; int32_t* __restrict__ Y1 = E.Y1; int32_t* __restrict__ Y2 = E.Y2; const int ldy = E.ldy; const int32_t* __restrict__ R = E.residual; const int Cs = E.Cs; const int32_t* __restrict__ Lphi = E.Lphi;
     if constexpr (EPI == EPI_QKV) {
         // one 64-column tile == one head of q, k or v. q/k: per-row max over the tile -> e -> hi/lo bytes + hs/ls/tsum (k_quant_heads layout)
@@ -241,6 +246,9 @@ __global__ void __launch_bounds__(NTHR) gemm_hl_k(const ASrc A, int Mreal, const
                     if (R) { const int2 rr = *reinterpret_cast<const int2*>(R + size_t(r) * ldy + n); y0 = int(sat32(i64(y0) + rr.x)); y1 = int(sat32(i64(y1) + rr.y)); }
                     *reinterpret_cast<int2*>(dst) = make_int2(y0, y1);
                     if (E.rowmax) { const uint32_t m = max(uint32_t(y0 < 0 ? -i64(y0) : y0), uint32_t(y1 < 0 ? -i64(y1) : y1)); if (h) mx1 = max(mx1, m); else mx0 = max(mx0, m); }
+                    if (EPI == EPI_PLAIN && gnsm) { const int cg = Nreal >> 5; const int g0 = n / cg, g1 = (n + 1) / cg;
+                        atomicAdd((unsigned long long*)(reinterpret_cast<i64*>(gnsm) + g0), (unsigned long long)(i64)y0); atomicMin(gnsm + 64 + g0, y0); atomicMax(gnsm + 96 + g0, y0);
+                        atomicAdd((unsigned long long*)(reinterpret_cast<i64*>(gnsm) + g1), (unsigned long long)(i64)y1); atomicMin(gnsm + 64 + g1, y1); atomicMax(gnsm + 96 + g1, y1); }
                 } else if (EPI == EPI_SPLIT3) {
                     const int part = n >= 2 * Cs ? 2 : (n >= Cs ? 1 : 0); int32_t* dst = (part == 0 ? Y : (part == 1 ? Y1 : Y2)) + size_t(r) * Cs + (n - part * Cs);
                     *reinterpret_cast<int2*>(dst) = make_int2(y0, y1);
@@ -256,6 +264,10 @@ __global__ void __launch_bounds__(NTHR) gemm_hl_k(const ASrc A, int Mreal, const
             for (int o = 1; o < 4; o <<= 1) { mx0 = max(mx0, __shfl_xor_sync(0xffffffffu, mx0, o)); mx1 = max(mx1, __shfl_xor_sync(0xffffffffu, mx1, o)); }
             if (t4 == 0) { if (r0 < Mreal && mx0) atomicMax(E.rowmax + r0, mx0); if (r1 < Mreal && mx1) atomicMax(E.rowmax + r1, mx1); }
         }
+    }
+    if (EPI == EPI_PLAIN && gnsm) {
+        __syncthreads();
+        if (tid < 32 && gnsm[64 + tid] != INT_MAX) { GnStat* g = gnst + (m0 / E.gnT) * 32 + tid; atomicAdd((unsigned long long*)&g->sum, (unsigned long long)reinterpret_cast<i64*>(gnsm)[tid]); atomicMin(&g->mn, gnsm[64 + tid]); atomicMax(&g->mx, gnsm[96 + tid]); }
     }
 }
 typedef Cfg<64, 64, 4, 4> CfgSmall;     // 64x64 tile, 48 KB smem, 2 blocks/SM   (small K)

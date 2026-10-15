@@ -33,7 +33,7 @@ private:
     void* dalloc(size_t n);
 };
 
-struct Tensor { int32_t* d = nullptr; int B = 0, T = 0, C = 0; uint32_t* rowmax = nullptr; size_t n() const { return size_t(B) * T * C; } };   // rowmax: per-row max|x| when the producer provided it
+struct Tensor { int32_t* d = nullptr; int B = 0, T = 0, C = 0; uint32_t* rowmax = nullptr; GnStat* gnst = nullptr; size_t n() const { return size_t(B) * T * C; } };   // gnst: producer-accumulated GroupNorm sum/min/max [B*32]   // rowmax: per-row max|x| when the producer provided it
 
 struct Arena {
     uint8_t* base = nullptr; size_t cap = 0, off = 0, peak = 0;
@@ -53,7 +53,7 @@ struct AttnKV {   // quantised key/value operands of one attention call
     int Tk = 0, Tkp = 0;
 };
 
-struct EngineConfig { int batch = 4; bool fusedAttention = true; int customGemmMaxK = 1536; /* gemm_hl for Kp <= this (0 = always cuBLASLt); deep-K convs stay on cuBLASLt (measured faster) */ bool fusedLoader = true; /* quantise A inside the GEMM (int32 + rowmax, implicit im2col) */ size_t arenaBytes = 0; size_t scoreBytes = 256u << 20; int gemmWorkspace = 32 << 20; bool graph = true; };
+struct EngineConfig { int batch = 4; bool fusedAttention = true; int customGemmMaxK = 1536; /* gemm_hl for Kp <= this (0 = always cuBLASLt); deep-K convs stay on cuBLASLt (measured faster) */ bool fusedLoader = true; /* quantise A inside the GEMM (int32 + rowmax, implicit im2col) */ bool gnFuse = false; /* producer-side GroupNorm stats (measured slower: smem atomics in the epilogue) */ size_t arenaBytes = 0; size_t scoreBytes = 256u << 20; int gemmWorkspace = 32 << 20; bool graph = true; };
 
 class Engine {
 public:
@@ -97,9 +97,11 @@ private:
     bool useHl(const Lin& L) const;
     Tensor gegluX(const QuantIn& q, const Lin& Li, int F);          // interleaved a|g GEMM with GEGLU epilogue -> int32 [rows, F] + rowmax
     /** GEMM on an int32 input quantised on load (needs x.rowmax); falls back to lin() when unavailable. */
-    Tensor linX(const Tensor& x, const Lin& L, int32_t* out = nullptr, const int32_t* residual = nullptr, int epi = 0, bool wantRowmax = false);
+    Tensor linX(const Tensor& x, const Lin& L, int32_t* out = nullptr, const int32_t* residual = nullptr, int epi = 0, bool wantRowmax = false, GnStat* gnOut = nullptr);
     uint32_t* rowmaxAlloc(int rows);
-    Tensor conv3(const Tensor& x, int H, int W, const Lin& L, int stride, int32_t* out = nullptr, const int32_t* residual = nullptr, const u32* pmIn = nullptr);
+    GnStat* gnAlloc(int B);                                   // zero-initialised stats for a producer to accumulate into
+    bool gnFusable(int T, int C) const { return cfg_.gnFuse && cfg_.fusedLoader && C % 32 == 0 && (size_t(T) * C) % 1024 == 0 && T % 64 == 0; }
+    Tensor conv3(const Tensor& x, int H, int W, const Lin& L, int stride, int32_t* out = nullptr, const int32_t* residual = nullptr, const u32* pmIn = nullptr, GnStat* gnOut = nullptr);   // gnOut: pre-allocated (gnAlloc) stats the epilogue accumulates; y.gnst set when done
     Tensor groupnorm(const Tensor& x, const Norm& nm);
     Tensor layernorm(const Tensor& x, const Norm& nm);
     void silu(Tensor& x);

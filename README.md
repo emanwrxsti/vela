@@ -23,7 +23,7 @@ is a real inference, verified by the pool with the same engine in `--verify-serv
 ./supr-meow-vela --bench 20 --batch 8     # throughput
 ./supr-meow-vela --verify-server --port 9010 --mem 1024 --batch 1   # pool verifier (HTTP POST /verify, GET /health)
 ```
-Measured: RTX 5090 ≈ 70–75 inferences/s (batch 8 × 2 lanes, 575 W); CMP 170HX ≈ 15 inf/s. One share at difficulty 2048 ≈ 28 s on a 5090.
+Measured (batch 8 × 2 lanes): RTX 5090 / RTX PRO 6000 ≈ 125–135 inf/s (575–600 W); RTX 6000 Ada ≈ 51; H200 ≈ 92; B200 ≈ 113; CMP 170HX ≈ 31.
 
 ## Build
 CUDA 12.8+ (13.3 used for releases), CMake ≥ 3.24, gcc 13. `cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j`.

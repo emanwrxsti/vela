@@ -10,7 +10,11 @@ is a real inference, verified by the pool with the same engine in `--verify-serv
 * Ampere (sm_80, e.g. CMP 170HX / A100 / 30xx), Ada (sm_89) and Blackwell consumer (sm_120, RTX 50xx) in one fatbin
 
 ## Download
-https://vela.suprnova.cc/dl/ — `supr-meow-vela-0.1.0.tar.gz` (Linux x86-64 + bundled CUDA 13.3 runtime), `supr-meow-vela-hiveos.tar.gz`, `sd-turbo-int.poisd`, `SHA256SUMS`.
+[GitHub Releases](https://github.com/ocminer/supr-meow-vela/releases) (and mirrored at https://vela.suprnova.cc/dl/):
+
+* `supr-meow-vela-0.1.0.tar.gz` — Linux x86-64 + bundled CUDA 13.3 runtime. One tarball serves **HiveOS** (`h-run.sh`), **MMPOS** (`mmpos-run.sh`) and **SMOS** (`smos-run.sh`) — pick the launcher for your OS; set `POOL_URL`, `WALLET` and (once) `MODEL_URL` in the flight sheet.
+* `supr-meow-vela-0.1.0-windows-x86_64.zip` — native **Windows** x64 build (no WSL/Docker). Edit `start.cmd` with your wallet and run it; the model downloads on first start. No TLS on Windows — use the plain-TCP port.
+* `sd-turbo-int.poisd` — the model (~1.2 GB), plus `SHA256SUMS`.
 
 ## Usage
 ```

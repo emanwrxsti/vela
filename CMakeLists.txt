@@ -20,18 +20,44 @@ add_executable(supr-meow-vela
   src/kernels.cu src/attn.cu src/gemm.cu src/gemm_hl.cu src/engine.cu)
 target_include_directories(supr-meow-vela PRIVATE src vendor ${CUDAToolkit_INCLUDE_DIRS})
 target_compile_options(supr-meow-vela PRIVATE
-  $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra -Wno-unused-parameter>
-  $<$<COMPILE_LANGUAGE:CUDA>:-O3 -lineinfo -Xcompiler=-Wall>)
-target_link_libraries(supr-meow-vela PRIVATE CUDA::cudart CUDA::cublasLt Threads::Threads)
-# Portable binary for mining OS images: static libstdc++/libgcc, CUDA runtime libs shipped in lib/ next to the binary (RPATH $ORIGIN/lib).
-option(MEOW_STATIC_LIBSTDCXX "Link libstdc++/libgcc statically" ON)
-if(MEOW_STATIC_LIBSTDCXX)
-  target_link_options(supr-meow-vela PRIVATE -static-libstdc++ -static-libgcc)
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:GNU,Clang>>:-O2 -Wall -Wextra -Wno-unused-parameter>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/O2 /EHsc /bigobj>
+  $<$<COMPILE_LANGUAGE:CUDA>:-O3 -lineinfo>
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<PLATFORM_ID:Windows>>>:-Xcompiler=-Wall>
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<PLATFORM_ID:Windows>>:-Xcompiler=/bigobj>)
+if(MSVC)
+  target_compile_definitions(supr-meow-vela PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
-set_target_properties(supr-meow-vela PROPERTIES BUILD_RPATH "\$ORIGIN/lib;${CUDAToolkit_LIBRARY_DIR}" INSTALL_RPATH "\$ORIGIN/lib" BUILD_WITH_INSTALL_RPATH ON)
+target_link_libraries(supr-meow-vela PRIVATE CUDA::cudart CUDA::cublasLt Threads::Threads)
+# Windows: Winsock. Linux mining-OS images: static libstdc++/libgcc + CUDA runtime libs in lib/ (RPATH $ORIGIN/lib).
+if(WIN32)
+  target_link_libraries(supr-meow-vela PRIVATE ws2_32)
+else()
+  option(MEOW_STATIC_LIBSTDCXX "Link libstdc++/libgcc statically" ON)
+  if(MEOW_STATIC_LIBSTDCXX AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_link_options(supr-meow-vela PRIVATE -static-libstdc++ -static-libgcc)
+  endif()
+  set_target_properties(supr-meow-vela PROPERTIES BUILD_RPATH "\$ORIGIN/lib;${CUDAToolkit_LIBRARY_DIR}" INSTALL_RPATH "\$ORIGIN/lib" BUILD_WITH_INSTALL_RPATH ON)
+  # NVML is dlopen'ed at runtime (device.cpp); link libdl where it is a separate library.
+  target_link_libraries(supr-meow-vela PRIVATE ${CMAKE_DL_LIBS})
+endif()
 if(OPENSSL_FOUND)
   target_compile_definitions(supr-meow-vela PRIVATE MEOW_HAVE_OPENSSL=1)
   target_link_libraries(supr-meow-vela PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 endif()
-# NVML is loaded with dlopen at runtime (device.cpp) so the binary runs where the driver has no dev package.
-target_link_libraries(supr-meow-vela PRIVATE ${CMAKE_DL_LIBS})
+
+# CPU-only self-test (share-target math + socket loopback); no GPU required, runs in CI.
+option(MEOW_BUILD_TESTS "Build CPU self-tests" OFF)
+if(MEOW_BUILD_TESTS)
+  add_executable(meow-net-test src/test_net.cpp)
+  target_include_directories(meow-net-test PRIVATE src)
+  target_link_libraries(meow-net-test PRIVATE Threads::Threads)
+  if(WIN32)
+    target_link_libraries(meow-net-test PRIVATE ws2_32)
+  endif()
+  if(MSVC)
+    target_compile_definitions(meow-net-test PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+  endif()
+  enable_testing()
+  add_test(NAME compat-selftest COMMAND meow-net-test)
+endif()

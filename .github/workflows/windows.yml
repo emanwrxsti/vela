@@ -1,0 +1,89 @@
+name: Native Windows CUDA
+on:
+  push:
+    branches: ['ci/windows-*']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-windows-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Cache CUDA toolkit
+        id: cuda-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/cuda-13.3
+          key: vela-cuda-13.3-v1
+      - name: Install NVIDIA toolkit
+        shell: pwsh
+        run: |
+          $cuda = Join-Path $env:RUNNER_TEMP 'cuda-13.3'
+          if (!(Test-Path "$cuda/installed-components.json")) {
+            python tools/install-windows-cuda.py --output $cuda
+            if ($LASTEXITCODE) { throw 'CUDA installation failed' }
+          }
+          "CUDA_PATH=$cuda" | Out-File $env:GITHUB_ENV -Append
+          "$cuda/bin" | Out-File $env:GITHUB_PATH -Append
+          "$cuda/bin/x64" | Out-File $env:GITHUB_PATH -Append
+      - name: Configure
+        id: configure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S . -B build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH/bin/nvcc.exe" `
+            -DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON `
+            -DMEOW_BUILD_TESTS=ON `
+            '-DCMAKE_CUDA_ARCHITECTURES=80;86;89;120' `
+            '-DCMAKE_CUDA_FLAGS=--diag-suppress=177 --diag-suppress=550'
+          if ($LASTEXITCODE) { throw 'CMake configure failed' }
+      - name: Build and run CPU self-test (target math + native sockets)
+        shell: pwsh
+        run: |
+          cmake --build build/windows --parallel 4 --target meow-net-test
+          if ($LASTEXITCODE) { throw 'Self-test build failed' }
+          ctest --test-dir build/windows --output-on-failure
+          if ($LASTEXITCODE) { throw 'CPU self-test failed (target math or native sockets)' }
+      - name: Compile miner host sources
+        shell: pwsh
+        run: |
+          $objects = @(& ninja -C build/windows -t targets all | ForEach-Object {
+            if ($_ -match '^(CMakeFiles[\\/]supr-meow-vela\.dir[\\/].*\.cpp\.obj):') { $Matches[1] }
+          })
+          if ($LASTEXITCODE -or $objects.Count -lt 3) { throw 'Miner host object targets are missing' }
+          Write-Host "Compiling $($objects.Count) host translation units"
+          cmake --build build/windows --parallel 4 --target $objects -- -k 0
+          if ($LASTEXITCODE) { throw 'Miner host compilation failed' }
+      - name: Build CUDA miner and package
+        id: cuda-build
+        shell: pwsh
+        run: |
+          cmake --build build/windows --parallel 4 --target supr-meow-vela
+          if ($LASTEXITCODE) { throw 'CUDA miner build failed' }
+          ./tools/package-windows.ps1
+          if ($LASTEXITCODE) { throw 'Native Windows packaging failed' }
+      - name: Upload native package
+        uses: actions/upload-artifact@v4
+        with:
+          name: supr-meow-vela-0.1.0-windows-x86_64
+          path: dist/*
+          if-no-files-found: error
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-diagnostics
+          path: |
+            build/windows/Testing/Temporary/*
+            build/windows/CMakeFiles/CMakeConfigureLog.yaml
+            build/windows/compile_commands.json
+          if-no-files-found: ignore

@@ -1,12 +1,7 @@
 #include "stratum.h"
 #include "common.h"
 #include <nlohmann/json.hpp>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#include <poll.h>
+#include "compat.h"
 #include <cmath>
 #include <cstring>
 #include <chrono>
@@ -23,8 +18,8 @@ std::array<uint8_t, 32> targetFromDifficulty(double difficulty) {
     if (!(difficulty >= 1)) { t.fill(0xff); return t; }
     uint64_t d = uint64_t(std::ceil(difficulty));            // stricter when fractional
     // long division of 2^256-1 (all 0xff) by d, most significant byte first
-    unsigned __int128 rem = 0;
-    for (int i = 31; i >= 0; --i) { rem = (rem << 8) | 0xff; t[i] = uint8_t(rem / d); rem %= d; }
+    uint64_t rem = 0;
+    for (int i = 31; i >= 0; --i) t[i] = div256_step(rem, d);
     return t;
 }
 bool hashMeetsTarget(const uint8_t* h, const std::array<uint8_t, 32>& t) {
@@ -36,34 +31,35 @@ StratumClient::StratumClient(std::string host, int port, bool tls, std::string w
     : host_(std::move(host)), port_(port), tls_(tls), wallet_(std::move(wallet)), password_(std::move(password)), ua_(std::move(ua)) {}
 StratumClient::~StratumClient() { stop(); }
 void StratumClient::start() { run_ = true; th_ = std::thread([this] { loop(); }); }
-void StratumClient::stop() { run_ = false; if (fd_ >= 0) ::shutdown(fd_, SHUT_RDWR); if (th_.joinable()) th_.join(); disconnect(); }
+void StratumClient::stop() { run_ = false; if (fd_ >= 0) net_shutdown(fd_); if (th_.joinable()) th_.join(); disconnect(); }
 bool StratumClient::currentJob(Job& out) const { std::lock_guard<std::mutex> l(mu_); if (job_.id.empty()) return false; out = job_; return true; }
 
 bool StratumClient::connect() {
+    net_global_init();
     struct addrinfo hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
     struct addrinfo* res = nullptr;
     if (getaddrinfo(host_.c_str(), std::to_string(port_).c_str(), &hints, &res) != 0 || !res) { log("stratum: cannot resolve " + host_); return false; }
-    int fd = -1;
+    sock_t fd = (sock_t)MEOW_INVALID_SOCK;
     for (auto* p = res; p; p = p->ai_next) {
         fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (fd < 0) continue;
-        struct timeval tv{15, 0}; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        if (::connect(fd, p->ai_addr, p->ai_addrlen) == 0) break;
-        ::close(fd); fd = -1;
+        if ((intptr_t)fd == MEOW_INVALID_SOCK) continue;
+        net_set_timeout((intptr_t)fd, 15);
+        if (::connect(fd, p->ai_addr, (int)p->ai_addrlen) == 0) break;
+        net_close((intptr_t)fd); fd = (sock_t)MEOW_INVALID_SOCK;
     }
     freeaddrinfo(res);
-    if (fd < 0) { log("stratum: connect to " + host_ + ":" + std::to_string(port_) + " failed: " + std::strerror(errno)); return false; }
-    int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)); setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-    fd_ = fd;
+    if ((intptr_t)fd == MEOW_INVALID_SOCK) { log("stratum: connect to " + host_ + ":" + std::to_string(port_) + " failed: " + net_strerror()); return false; }
+    int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one)); setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (const char*)&one, sizeof(one));
+    fd_ = (intptr_t)fd;
     if (tls_) {
 #ifdef MEOW_HAVE_OPENSSL
         static bool init = false; if (!init) { SSL_library_init(); SSL_load_error_strings(); init = true; }
         SSL_CTX* ctx = SSL_CTX_new(TLS_client_method()); SSL* ssl = SSL_new(ctx);
         SSL_set_tlsext_host_name(ssl, host_.c_str()); SSL_set_fd(ssl, fd);
-        if (SSL_connect(ssl) != 1) { log("stratum: TLS handshake failed"); SSL_free(ssl); SSL_CTX_free(ctx); ::close(fd); fd_ = -1; return false; }
+        if (SSL_connect(ssl) != 1) { log("stratum: TLS handshake failed"); SSL_free(ssl); SSL_CTX_free(ctx); net_close((intptr_t)fd); fd_ = -1; return false; }
         ssl_ = ssl; sslCtx_ = ctx;
 #else
-        log("stratum: built without OpenSSL, --tls unavailable"); ::close(fd); fd_ = -1; return false;
+        log("stratum: built without OpenSSL, --tls unavailable"); net_close((intptr_t)fd); fd_ = -1; return false;
 #endif
     }
     rbuf_.clear();
@@ -74,7 +70,7 @@ void StratumClient::disconnect() {
     if (ssl_) { SSL_shutdown((SSL*)ssl_); SSL_free((SSL*)ssl_); ssl_ = nullptr; }
     if (sslCtx_) { SSL_CTX_free((SSL_CTX*)sslCtx_); sslCtx_ = nullptr; }
 #endif
-    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    if (fd_ >= 0) { net_close(fd_); fd_ = -1; }
     stats.connected = false;
 }
 bool StratumClient::sendLine(const std::string& s) {
@@ -82,11 +78,11 @@ bool StratumClient::sendLine(const std::string& s) {
     if (fd_ < 0) return false;
     std::string line = s + "\n"; size_t off = 0;
     while (off < line.size()) {
-        ssize_t n;
+        long long n;
 #ifdef MEOW_HAVE_OPENSSL
         if (ssl_) n = SSL_write((SSL*)ssl_, line.data() + off, int(line.size() - off)); else
 #endif
-        n = ::send(fd_, line.data() + off, line.size() - off, MSG_NOSIGNAL);
+        n = net_send(fd_, line.data() + off, line.size() - off);
         if (n <= 0) return false;
         off += size_t(n);
     }
@@ -97,13 +93,13 @@ bool StratumClient::readLine(std::string& out) {
         size_t nl = rbuf_.find('\n');
         if (nl != std::string::npos) { out = rbuf_.substr(0, nl); rbuf_.erase(0, nl + 1); return true; }
         if (rbuf_.size() > (2u << 20)) return false;
-        char buf[65536]; ssize_t n;
+        char buf[65536]; long long n;
 #ifdef MEOW_HAVE_OPENSSL
         if (ssl_) n = SSL_read((SSL*)ssl_, buf, sizeof(buf)); else
 #endif
-        n = ::recv(fd_, buf, sizeof(buf), 0);
+        n = net_recv(fd_, buf, sizeof(buf));
         if (n <= 0) {
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { if (!run_) return false; continue; }   // timeout: keep waiting
+            if (n < 0 && net_would_block()) { if (!run_) return false; continue; }   // timeout: keep waiting
             return false;
         }
         rbuf_.append(buf, size_t(n));

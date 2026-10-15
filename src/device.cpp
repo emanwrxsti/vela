@@ -1,6 +1,6 @@
 #include "device.h"
 #include "common.h"
-#include <dlfcn.h>
+#include "compat.h"
 #include <mutex>
 
 namespace meow {
@@ -17,10 +17,10 @@ struct Nvml { void* h = nullptr; nvmlGetByPci_t byPci = nullptr; nvmlTemp_t temp
 Nvml& nvml() {
     static Nvml n; static std::once_flag once;
     std::call_once(once, [] {
-        n.h = dlopen("libnvidia-ml.so.1", RTLD_NOW); if (!n.h) return;
-        auto init = (nvmlInit_t)dlsym(n.h, "nvmlInit_v2"); if (!init || init() != 0) return;
-        n.byPci = (nvmlGetByPci_t)dlsym(n.h, "nvmlDeviceGetHandleByPciBusId_v2"); n.temp = (nvmlTemp_t)dlsym(n.h, "nvmlDeviceGetTemperature");
-        n.power = (nvmlPower_t)dlsym(n.h, "nvmlDeviceGetPowerUsage"); n.util = (nvmlUtil_t)dlsym(n.h, "nvmlDeviceGetUtilizationRates"); n.fan = (nvmlFan_t)dlsym(n.h, "nvmlDeviceGetFanSpeed");
+        n.h = dl_open(nvml_lib()); if (!n.h) return;
+        auto init = (nvmlInit_t)dl_sym(n.h, "nvmlInit_v2"); if (!init || init() != 0) return;
+        n.byPci = (nvmlGetByPci_t)dl_sym(n.h, "nvmlDeviceGetHandleByPciBusId_v2"); n.temp = (nvmlTemp_t)dl_sym(n.h, "nvmlDeviceGetTemperature");
+        n.power = (nvmlPower_t)dl_sym(n.h, "nvmlDeviceGetPowerUsage"); n.util = (nvmlUtil_t)dl_sym(n.h, "nvmlDeviceGetUtilizationRates"); n.fan = (nvmlFan_t)dl_sym(n.h, "nvmlDeviceGetFanSpeed");
         n.ok = n.byPci && n.temp && n.power;
     });
     return n;

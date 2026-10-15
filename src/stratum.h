@@ -52,7 +52,7 @@ private:
     bool readLine(std::string& out);
     void handle(const std::string& line);
     std::string host_; int port_; bool tls_; std::string wallet_, password_, ua_;
-    int fd_ = -1; void* ssl_ = nullptr; void* sslCtx_ = nullptr; std::string rbuf_;
+    intptr_t fd_ = -1; void* ssl_ = nullptr; void* sslCtx_ = nullptr; std::string rbuf_;
     std::thread th_; std::atomic<bool> run_{false};
     mutable std::mutex mu_; Job job_; std::atomic<uint64_t> gen_{0};
     std::string extranonce1_, modelHash_; double difficulty_ = 0; bool haveDiff_ = false;

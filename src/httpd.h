@@ -4,6 +4,7 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <cstdint>
 
 namespace meow {
 struct HttpRequest { std::string method, path, body; };
@@ -16,8 +17,8 @@ public:
     void stop();
 private:
     void acceptLoop();
-    void serve(int fd);
+    void serve(intptr_t fd);
     std::string host_; int port_; std::function<HttpResponse(const HttpRequest&)> handler_;
-    int threads_; int lfd_ = -1; std::vector<std::thread> workers_; std::thread acceptor_; std::atomic<bool> run_{false};
+    int threads_; intptr_t lfd_ = -1; std::vector<std::thread> workers_; std::thread acceptor_; std::atomic<bool> run_{false};
 };
 }  // namespace meow

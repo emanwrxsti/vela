@@ -1,9 +1,5 @@
 #include "httpd.h"
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "compat.h"
 #include <cstring>
 #include <mutex>
 #include <condition_variable>
@@ -11,46 +7,48 @@
 #include <vector>
 
 namespace meow {
-namespace { std::mutex qmu; std::condition_variable qcv; std::queue<int> q; }
+namespace { std::mutex qmu; std::condition_variable qcv; std::queue<intptr_t> q; }
 
 Httpd::Httpd(std::string host, int port, std::function<HttpResponse(const HttpRequest&)> h, int threads) : host_(std::move(host)), port_(port), handler_(std::move(h)), threads_(threads) {}
 Httpd::~Httpd() { stop(); }
 void Httpd::start() {
-    lfd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    int one = 1; setsockopt(lfd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    net_global_init();
+    sock_t ls = ::socket(AF_INET, SOCK_STREAM, 0);
+    lfd_ = (intptr_t)ls;
+    int one = 1; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof(one));
     sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(uint16_t(port_)); a.sin_addr.s_addr = host_.empty() || host_ == "0.0.0.0" ? INADDR_ANY : inet_addr(host_.c_str());
-    if (::bind(lfd_, (sockaddr*)&a, sizeof(a)) != 0) throw std::runtime_error(std::string("httpd bind: ") + std::strerror(errno));
-    if (::listen(lfd_, 64) != 0) throw std::runtime_error("httpd listen");
+    if (::bind(ls, (sockaddr*)&a, sizeof(a)) != 0) throw std::runtime_error(std::string("httpd bind: ") + net_strerror());
+    if (::listen(ls, 64) != 0) throw std::runtime_error("httpd listen");
     run_ = true;
     for (int i = 0; i < threads_; ++i) workers_.emplace_back([this] {
         for (;;) {
-            int fd; { std::unique_lock<std::mutex> l(qmu); qcv.wait(l, [&] { return !q.empty() || !run_; }); if (!run_ && q.empty()) return; fd = q.front(); q.pop(); }
-            serve(fd); ::close(fd);
+            intptr_t fd; { std::unique_lock<std::mutex> l(qmu); qcv.wait(l, [&] { return !q.empty() || !run_; }); if (!run_ && q.empty()) return; fd = q.front(); q.pop(); }
+            serve(fd); net_close(fd);
         }
     });
     acceptor_ = std::thread([this] { acceptLoop(); });
 }
 void Httpd::stop() {
     if (!run_) return; run_ = false;
-    if (lfd_ >= 0) { ::shutdown(lfd_, SHUT_RDWR); ::close(lfd_); lfd_ = -1; }
+    if (lfd_ >= 0) { net_shutdown(lfd_); net_close(lfd_); lfd_ = -1; }
     qcv.notify_all();
     if (acceptor_.joinable()) acceptor_.join();
     for (auto& t : workers_) if (t.joinable()) t.join();
 }
 void Httpd::acceptLoop() {
     while (run_) {
-        int fd = ::accept(lfd_, nullptr, nullptr);
-        if (fd < 0) { if (!run_) return; continue; }
-        struct timeval tv{30, 0}; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        { std::lock_guard<std::mutex> l(qmu); q.push(fd); } qcv.notify_one();
+        sock_t fd = ::accept((sock_t)lfd_, nullptr, nullptr);
+        if ((intptr_t)fd == MEOW_INVALID_SOCK) { if (!run_) return; continue; }
+        net_set_timeout((intptr_t)fd, 30);
+        int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
+        { std::lock_guard<std::mutex> l(qmu); q.push((intptr_t)fd); } qcv.notify_one();
     }
 }
-void Httpd::serve(int fd) {
+void Httpd::serve(intptr_t fd) {
     std::string buf; char tmp[65536];
     size_t hdrEnd = std::string::npos;
     while (hdrEnd == std::string::npos) {
-        ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0); if (n <= 0) return; buf.append(tmp, size_t(n));
+        long long n = net_recv(fd, tmp, sizeof(tmp)); if (n <= 0) return; buf.append(tmp, size_t(n));
         hdrEnd = buf.find("\r\n\r\n"); if (buf.size() > (1u << 20) && hdrEnd == std::string::npos) return;
     }
     std::string head = buf.substr(0, hdrEnd); HttpRequest req;
@@ -61,12 +59,12 @@ void Httpd::serve(int fd) {
     size_t cl = lower.find("content-length:"); if (cl != std::string::npos) clen = std::stoul(lower.substr(cl + 15));
     if (clen > (4u << 20)) return;
     req.body = buf.substr(hdrEnd + 4);
-    while (req.body.size() < clen) { ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0); if (n <= 0) return; req.body.append(tmp, size_t(n)); }
+    while (req.body.size() < clen) { long long n = net_recv(fd, tmp, sizeof(tmp)); if (n <= 0) return; req.body.append(tmp, size_t(n)); }
     req.body.resize(clen);
     HttpResponse r;
     try { r = handler_(req); } catch (const std::exception& e) { r.status = 500; r.body = std::string("{\"error\":\"") + e.what() + "\"}"; }
     const char* st = r.status == 200 ? "OK" : (r.status == 400 ? "Bad Request" : (r.status == 404 ? "Not Found" : "Error"));
     std::string out = "HTTP/1.1 " + std::to_string(r.status) + " " + st + "\r\nContent-Type: " + r.contentType + "\r\nContent-Length: " + std::to_string(r.body.size()) + "\r\nConnection: close\r\n\r\n" + r.body;
-    size_t off = 0; while (off < out.size()) { ssize_t n = ::send(fd, out.data() + off, out.size() - off, MSG_NOSIGNAL); if (n <= 0) return; off += size_t(n); }
+    size_t off = 0; while (off < out.size()) { long long n = net_send(fd, out.data() + off, out.size() - off); if (n <= 0) return; off += size_t(n); }
 }
 }  // namespace meow

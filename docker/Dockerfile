@@ -1,7 +1,7 @@
 # supr-meow-vela — Vela PoI v2 GPU miner. Multi-stage: build from source, ship a slim runtime.
 ARG CUDA_IMAGE=13.0.0
 FROM nvidia/cuda:${CUDA_IMAGE}-devel-ubuntu24.04 AS build
-ARG CUDA_ARCHS="80;86;89;120"
+ARG CUDA_ARCHS="80;86;89;90;100;120"
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake git ca-certificates \

@@ -1,7 +1,10 @@
 cmake_minimum_required(VERSION 3.24)
 # One fatbin for every card we care about: Ampere (A100 / 170HX / 30xx), Ada, Blackwell consumer. Must be set BEFORE project().
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES "80;86;89;120")
+  # Ampere (80 A100/170HX/30xx, 86 A6000), Ada (89), Hopper (90 H100/H200),
+  # Blackwell datacenter (100 B200) and consumer (120 RTX 50xx / PRO 6000).
+  # sm_90/sm_100 need CUDA 12.8+ (13.x for the releases).
+  set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90;100;120")
 endif()
 project(supr-meow-vela LANGUAGES C CXX CUDA)
 set(CMAKE_CXX_STANDARD 20)

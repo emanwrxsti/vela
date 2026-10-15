@@ -43,7 +43,7 @@ jobs:
             -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH/bin/nvcc.exe" `
             -DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON `
             -DMEOW_BUILD_TESTS=ON `
-            '-DCMAKE_CUDA_ARCHITECTURES=80;86;89;120' `
+            '-DCMAKE_CUDA_ARCHITECTURES=80;86;89;90;100;120' `
             '-DCMAKE_CUDA_FLAGS=--diag-suppress=177 --diag-suppress=550'
           if ($LASTEXITCODE) { throw 'CMake configure failed' }
       - name: Build and run CPU self-test (target math + native sockets)

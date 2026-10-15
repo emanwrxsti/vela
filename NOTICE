@@ -1,0 +1,14 @@
+supr-meow-vela
+Copyright (c) 2026 ocminer / suprnova
+
+The miner itself is MIT-licensed (see LICENSE). The third-party component below
+keeps its own terms, which travel with any binary built from this repository.
+
+--------------------------------------------------------------------------------
+nlohmann/json — MIT
+    vendor/nlohmann/json.hpp
+    Copyright (c) 2013-2022 Niels Lohmann
+
+--------------------------------------------------------------------------------
+The sd-turbo-int model mined against is licensed by its respective authors and
+is not distributed with this software.

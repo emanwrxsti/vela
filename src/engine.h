@@ -44,6 +44,9 @@ struct Arena {
 };
 
 struct QuantIn { int8_t* hi = nullptr; int8_t* lo = nullptr; int32_t* e = nullptr; int B = 0, T = 0, K = 0, Kp = 0, Mp = 0; int rows() const { return B * T; } };
+struct HeadQ {    // head-quantised attention operand (k_quant_heads layout): [G, Tp, 64] hi/lo, per-(g,t) e, hs, ls, tsum
+    int8_t *hi = nullptr, *lo = nullptr; int32_t* e = nullptr; i64 *hs = nullptr, *ls = nullptr, *tsum = nullptr; int B = 0, T = 0, Tp = 0, heads = 0;
+};
 struct AttnKV {   // quantised key/value operands of one attention call
     int8_t *khi = nullptr, *klo = nullptr, *vthi = nullptr, *vtlo = nullptr;
     int32_t *ek = nullptr, *ev = nullptr; i64 *ksum = nullptr, *vsum = nullptr;
@@ -85,6 +88,11 @@ private:
     QuantIn groupnormQ(const Tensor& x, const Norm& nm);
     Tensor groupnormSilu(const Tensor& x, const Norm& nm, u32*& pm);   // GN + SiLU + pixel max (for conv3)
     void linQ3(const QuantIn& q, const Lin& L, int Cs, Tensor& y0, Tensor& y1, Tensor& y2);   // merged GEMM, split epilogue
+    /** merged q|k|v GEMM whose epilogue writes q and k head-quantised (TqRows = real query/key tokens per sample) and v as int32 */
+    void linQ3H(const QuantIn& q, const Lin& L, int C, int heads, int Treal, HeadQ& qh, HeadQ& kh, Tensor& v);
+    HeadQ headAlloc(int B, int heads, int T, int Tp);
+    AttnKV quantKVH(const HeadQ& k, const Tensor& v, int heads);
+    Tensor attentionH(const HeadQ& q, const AttnKV& kv, int heads, bool causal, int Tq, int C);
     QuantIn linQGegluQ(const QuantIn& q, const Lin& L, int F, const Lin* Li = nullptr);          // merged [a|g] GEMM + GEGLU + quant (Li = interleaved weights for the custom GEMM)
     bool useHl(const Lin& L) const;
     Tensor gegluX(const QuantIn& q, const Lin& Li, int F);          // interleaved a|g GEMM with GEGLU epilogue -> int32 [rows, F] + rowmax

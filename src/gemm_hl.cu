@@ -155,6 +155,69 @@ __global__ void __launch_bounds__(NTHR) gemm_hl_k(const ASrc A, int Mreal, const
     for (int kt = 0; kt < nK; kt += 2) { step(kt, raw0); if (kt + 1 < nK) step(kt + 1, raw1); }
     cp_wait<0>();
     int32_t* __restrict__ Y = E.Y; int32_t* __restrict__ Y1 = E.Y1; int32_t* __restrict__ Y2 = E.Y2; const int ldy = E.ldy; const int32_t* __restrict__ R = E.residual; const int Cs = E.Cs; const int32_t* __restrict__ Lphi = E.Lphi;
+    if constexpr (EPI == EPI_QKV) {
+        // one 64-column tile == one head of q, k or v. q/k: per-row max over the tile -> e -> hi/lo bytes + hs/ls/tsum (k_quant_heads layout)
+        static_assert(EPI != EPI_QKV || (BM == 64 && BN == 64 && MI == 1 && NI == 4), "EPI_QKV needs the 64x64 tile");
+        __syncthreads();                                   // pipeline smem is free now
+        uint32_t* rmax = reinterpret_cast<uint32_t*>(smem); int* shs = reinterpret_cast<int*>(smem) + 64; int* sls = shs + 64; int* sts = sls + 64;
+        if (tid < 64) { rmax[tid] = 0; shs[tid] = 0; sls[tid] = 0; sts[tid] = 0; }
+        const int part = n0 / E.C, head = (n0 - part * E.C) >> 6;
+        const int r0 = m0 + wm * 16 + gid, r1 = r0 + 8;
+        const int e0 = (SRC == SRC_X32) ? (r0 < Mreal ? rowexp_u32(A.rowmax[r0]) : 0) : (r0 < Mreal ? e[r0] : 0);
+        const int e1 = (SRC == SRC_X32) ? (r1 < Mreal ? rowexp_u32(A.rowmax[r1]) : 0) : (r1 < Mreal ? e[r1] : 0);
+        int yv[4][4];
+        #pragma unroll
+        for (int ni = 0; ni < 4; ++ni) {
+            const int n = n0 + (wn * 4 + ni) * 8 + t4 * 2; const int4 c0 = cst[n], c1 = cst[n + 1];
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) { const int er = h ? e1 : e0; yv[ni][2 * h] = epi1(acc[0][0][ni][2 * h], acc[1][0][ni][2 * h], c0, er); yv[ni][2 * h + 1] = epi1(acc[0][0][ni][2 * h + 1], acc[1][0][ni][2 * h + 1], c1, er); }
+        }
+        if (part == 2) {                                   // v: plain int32 [rows, C]
+            #pragma unroll
+            for (int ni = 0; ni < 4; ++ni) { const int d = (wn * 4 + ni) * 8 + t4 * 2;
+                if (r0 < Mreal) *reinterpret_cast<int2*>(Y2 + size_t(r0) * E.C + head * 64 + d) = make_int2(yv[ni][0], yv[ni][1]);
+                if (r1 < Mreal) *reinterpret_cast<int2*>(Y2 + size_t(r1) * E.C + head * 64 + d) = make_int2(yv[ni][2], yv[ni][3]); }
+            return;
+        }
+        uint32_t m0v = 0, m1v = 0;
+        #pragma unroll
+        for (int ni = 0; ni < 4; ++ni) { m0v = max(m0v, max(uint32_t(yv[ni][0] < 0 ? -i64(yv[ni][0]) : yv[ni][0]), uint32_t(yv[ni][1] < 0 ? -i64(yv[ni][1]) : yv[ni][1]))); m1v = max(m1v, max(uint32_t(yv[ni][2] < 0 ? -i64(yv[ni][2]) : yv[ni][2]), uint32_t(yv[ni][3] < 0 ? -i64(yv[ni][3]) : yv[ni][3]))); }
+        for (int o = 1; o < 4; o <<= 1) { m0v = max(m0v, __shfl_xor_sync(0xffffffffu, m0v, o)); m1v = max(m1v, __shfl_xor_sync(0xffffffffu, m1v, o)); }
+        __syncthreads();
+        if (t4 == 0) { atomicMax(rmax + wm * 16 + gid, m0v); atomicMax(rmax + wm * 16 + gid + 8, m1v); }
+        __syncthreads();
+        const int eq0 = rowexp_u32(rmax[wm * 16 + gid]), eq1 = rowexp_u32(rmax[wm * 16 + gid + 8]);
+        const int Tp = part == 0 ? E.TpQ : E.TpK;
+        int8_t* hi = part == 0 ? E.qhi : E.khi; int8_t* lo = part == 0 ? E.qlo : E.klo;
+        int hs0 = 0, ls0 = 0, ts0 = 0, hs1 = 0, ls1 = 0, ts1 = 0;
+        #pragma unroll
+        for (int ni = 0; ni < 4; ++ni) {
+            const int d = (wn * 4 + ni) * 8 + t4 * 2;
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int r = h ? r1 : r0; if (r >= Mreal) continue;
+                const int ee = h ? eq1 : eq0;
+                const int qa = quant16_32(yv[ni][2 * h], ee), qb = quant16_32(yv[ni][2 * h + 1], ee);
+                const int ha = qa >> 8, hb = qb >> 8, la = (qa & 255) - 128, lb = (qb & 255) - 128;
+                const int b = r / E.T, t = r - b * E.T; const size_t o = (size_t(b * E.heads + head) * Tp + t) * 64 + d;
+                *reinterpret_cast<uint16_t*>(hi + o) = uint16_t(uint8_t(ha) | (uint16_t(uint8_t(hb)) << 8));
+                *reinterpret_cast<uint16_t*>(lo + o) = uint16_t(uint8_t(la) | (uint16_t(uint8_t(lb)) << 8));
+                if (h) { hs1 += ha + hb; ls1 += la + lb; ts1 += qa + qb; } else { hs0 += ha + hb; ls0 += la + lb; ts0 += qa + qb; }
+            }
+        }
+        for (int o = 1; o < 4; o <<= 1) { hs0 += __shfl_xor_sync(0xffffffffu, hs0, o); ls0 += __shfl_xor_sync(0xffffffffu, ls0, o); ts0 += __shfl_xor_sync(0xffffffffu, ts0, o); hs1 += __shfl_xor_sync(0xffffffffu, hs1, o); ls1 += __shfl_xor_sync(0xffffffffu, ls1, o); ts1 += __shfl_xor_sync(0xffffffffu, ts1, o); }
+        if (t4 == 0) { atomicAdd(shs + wm * 16 + gid, hs0); atomicAdd(sls + wm * 16 + gid, ls0); atomicAdd(sts + wm * 16 + gid, ts0); atomicAdd(shs + wm * 16 + gid + 8, hs1); atomicAdd(sls + wm * 16 + gid + 8, ls1); atomicAdd(sts + wm * 16 + gid + 8, ts1); }
+        __syncthreads();
+        if (tid < 64) {
+            const int r = m0 + tid;
+            if (r < Mreal) {
+                const int b = r / E.T, t = r - b * E.T; const size_t gt = size_t(b * E.heads + head) * Tp + t;
+                int32_t* ep = part == 0 ? E.qe : E.ke; int64_t* hsp = part == 0 ? E.qhs : E.khs; int64_t* lsp = part == 0 ? E.qls : E.kls; int64_t* tsp = part == 0 ? E.qts : E.kts;
+                ep[gt] = rowexp_u32(rmax[tid]); hsp[gt] = shs[tid]; lsp[gt] = sls[tid]; tsp[gt] = sts[tid];
+            }
+        }
+        return;
+    }
     #pragma unroll
     for (int mi = 0; mi < MI; ++mi) {
         const int r0 = m0 + wm * C::WTM + mi * 16 + gid, r1 = r0 + 8;
@@ -208,6 +271,7 @@ template <int SRC, class C> void launch_epi(int epi, dim3 grid, cudaStream_t st,
         case EPI_SPLIT3: launch<EPI_SPLIT3, SRC, C>(grid, st, A, Mreal, W, ldw, Nreal, Kp, cst, E); break;
         case EPI_GEGLU: launch<EPI_GEGLU, SRC, C>(grid, st, A, Mreal, W, ldw, Nreal, Kp, cst, E); break;
         case EPI_GELU: launch<EPI_GELU, SRC, C>(grid, st, A, Mreal, W, ldw, Nreal, Kp, cst, E); break;
+        case EPI_QKV: if constexpr (C::BM == 64 && C::BN == 64) { launch<EPI_QKV, SRC, C>(grid, st, A, Mreal, W, ldw, Nreal, Kp, cst, E); } else throw std::runtime_error("EPI_QKV needs 64x64 tiles"); break;
         default: launch<EPI_PLAIN, SRC, C>(grid, st, A, Mreal, W, ldw, Nreal, Kp, cst, E);
     }
 }
@@ -234,6 +298,7 @@ void k_gemm_hl2(cudaStream_t st, const ASrc& A, int Mp, int Mreal, const int8_t*
     if (v == 2 && Np % 128) v = 0;
     if (A.src != SRC_I8) v = v == 1 ? 0 : v;                                           // register-path loaders need 64 output rows per block
     if (A.src == SRC_CONV32 && (A.C % 16 || A.K != 9 * A.C)) throw std::runtime_error("gemm_hl conv source: C % 16 or K");
+    if (E.epi == EPI_QKV) v = 0;
     if (A.src == SRC_I8) {
         if (v == 1) { dim3 grid(Np / 64, Mp / 128); launch_epi<SRC_I8, CfgTall>(E.epi, grid, st, A, Mreal, W, ldw, Nreal, Kp, cst, E); }
         else if (v == 2) { dim3 grid(Np / 128, Mp / 64); launch_epi<SRC_I8, CfgWide>(E.epi, grid, st, A, Mreal, W, ldw, Nreal, Kp, cst, E); }

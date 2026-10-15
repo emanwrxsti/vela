@@ -646,6 +646,17 @@ void k_attn_out(cudaStream_t st, const int32_t* Ohh, const int32_t* Ohl, const i
     attn_out_k<<<gridFor(size_t(B) * heads * Qc * 64), NT, 0, st>>>(Ohh, Ohl, Olh, Oll, phs, pls, vsum, ev, B, heads, Tq, q0, Qc, C, out);
 }
 void k_zero(cudaStream_t st, void* p, size_t bytes) { cudaMemsetAsync(p, 0, bytes, st); }
+__global__ void quant_heads_pad_k(int G, int T, int Tp, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, i64* __restrict__ hs, i64* __restrict__ ls, i64* __restrict__ tsum) {
+    const int w = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31; const int npad = Tp - T;
+    if (w >= G * npad) return;
+    const int g = w / npad, t = T + w % npad; const size_t row = size_t(g) * Tp + t;
+    hi[row * 64 + lane] = 0; hi[row * 64 + 32 + lane] = 0; lo[row * 64 + lane] = -128; lo[row * 64 + 32 + lane] = -128;
+    if (lane == 0) { e[row] = 0; hs[row] = 0; ls[row] = -128 * 64; tsum[row] = 0; }
+}
+void k_quant_heads_pad(cudaStream_t st, int G, int T, int Tp, int8_t* hi, int8_t* lo, int32_t* e, i64* hs, i64* ls, i64* tsum) {
+    if (Tp <= T) return;
+    quant_heads_pad_k<<<gridFor(size_t(G) * (Tp - T) * 32), NT, 0, st>>>(G, T, Tp, hi, lo, e, hs, ls, tsum);
+}
 void k_epilogue_split(cudaStream_t st, const int32_t* Chi, const int32_t* Clo, int M, int N, int ldc, const int4* cst, const int32_t* e, int Cs, int32_t* Y0, int32_t* Y1, int32_t* Y2) {
     epilogue_split_k<<<dim3(gridFor(N), unsigned(std::min(M, 65535))), NT, 0, st>>>(Chi, Clo, M, N, ldc, cst, e, Cs, Y0, Y1, Y2);
 }

@@ -302,6 +302,45 @@ AttnKV Engine::quantKV(const Tensor& k, const Tensor& v, int heads) {
     k_quant_v(st_, v.d, v.B, v.T, v.C, heads, kv.Tkp, kv.vthi, kv.vtlo, kv.ev, kv.vsum, scratch);
     return kv;
 }
+HeadQ Engine::headAlloc(int B, int heads, int T, int Tp) {
+    HeadQ h; h.B = B; h.T = T; h.Tp = Tp; h.heads = heads; const size_t G = size_t(B) * heads;
+    h.hi = (int8_t*)arena_.alloc(G * Tp * 64); h.lo = (int8_t*)arena_.alloc(G * Tp * 64);
+    h.e = (int32_t*)arena_.alloc(G * Tp * 4); h.hs = (i64*)arena_.alloc(G * Tp * 8); h.ls = (i64*)arena_.alloc(G * Tp * 8); h.tsum = (i64*)arena_.alloc(G * Tp * 8);
+    return h;
+}
+void Engine::linQ3H(const QuantIn& q, const Lin& L, int C, int heads, int Treal, HeadQ& qh, HeadQ& kh, Tensor& v) {
+    if (q.K != L.K || L.N != 3 * C || C != heads * 64) throw std::runtime_error("linQ3H: shape mismatch");
+    const int rows = q.rows(), Mp = q.Mp;
+    const int TpQ = int(align_up(Treal, 128)), TpK = int(align_up(Treal, 64));
+    qh = headAlloc(q.B, heads, Treal, TpQ); kh = headAlloc(q.B, heads, Treal, TpK);
+    v = talloc(q.B, q.T, C);
+    ASrc A; A.src = SRC_I8; A.hi = q.hi; A.lo = q.lo; A.ld8 = L.Kp; A.e = q.e;
+    AEpi E; E.epi = EPI_QKV; E.Y2 = v.d; E.heads = heads; E.T = q.T; E.TpQ = TpQ; E.TpK = TpK; E.C = C;
+    E.qhi = qh.hi; E.qlo = qh.lo; E.qe = qh.e; E.qhs = qh.hs; E.qls = qh.ls; E.qts = qh.tsum; E.khi = kh.hi; E.klo = kh.lo; E.ke = kh.e; E.khs = kh.hs; E.kls = kh.ls; E.kts = kh.tsum;
+    k_gemm_hl2(st_, A, Mp, rows, L.w, L.Kp, L.Np, L.N, L.Kp, L.cst, E);
+    const int G = q.B * heads;
+    k_quant_heads_pad(st_, G, q.T, TpQ, qh.hi, qh.lo, qh.e, qh.hs, qh.ls, qh.tsum);     // rows the GEMM did not write
+    k_quant_heads_pad(st_, G, q.T, TpK, kh.hi, kh.lo, kh.e, kh.hs, kh.ls, kh.tsum);
+}
+AttnKV Engine::quantKVH(const HeadQ& k, const Tensor& v, int heads) {
+    AttnKV kv; kv.Tk = k.T; kv.Tkp = k.Tp; const int G = v.B * heads;
+    kv.khi = k.hi; kv.klo = k.lo; kv.ek = k.e; kv.ksum = k.tsum;
+    kv.vthi = (int8_t*)arena_.alloc(size_t(G) * 64 * kv.Tkp); kv.vtlo = (int8_t*)arena_.alloc(size_t(G) * 64 * kv.Tkp);
+    kv.ev = (int32_t*)arena_.alloc(size_t(G) * 64 * 4); kv.vsum = (i64*)arena_.alloc(size_t(G) * 64 * 8);
+    u32* scratch = (u32*)arena_.alloc(size_t(G) * 64 * 4);
+    k_quant_v(st_, v.d, v.B, k.T, v.C, heads, kv.Tkp, kv.vthi, kv.vtlo, kv.ev, kv.vsum, scratch);
+    return kv;
+}
+Tensor Engine::attentionH(const HeadQ& q, const AttnKV& kv, int heads, bool causal, int Tq, int C) {
+    const int B = q.B, G = B * heads, Tqp = q.Tp;
+    Tensor out = talloc(B, Tq, C);
+    if (cfg_.fusedLoader) out.rowmax = rowmaxAlloc(B * Tq);
+    size_t mk = arena_.mark();
+    int32_t* gmx = (int32_t*)arena_.alloc(size_t(G) * Tqp * 4); i64* gr = (i64*)arena_.alloc(size_t(G) * Tqp * 8);
+    k_fused_attention(st_, q.hi, q.lo, q.e, q.hs, q.ls, kv.khi, kv.klo, kv.ek, kv.ksum, kv.vthi, kv.vtlo, kv.ev, kv.vsum, B, heads, Tq, Tqp, kv.Tk, kv.Tkp, causal, dm_.lutExp, C, gmx, gr, out.d, out.rowmax);
+    arena_.release(mk);
+    return out;
+}
 Tensor Engine::attention(const Tensor& q, const AttnKV& kv, int heads, bool causal, int Tq) {
     int B = q.B, C = q.C, G = B * heads, Tqp = int(align_up(q.T, 32));
     if (C != heads * 64) throw std::runtime_error("attention: C != heads*64");
@@ -367,9 +406,16 @@ Tensor Engine::transformer(const Tensor& x, const std::string& p, int heads) {
     {
         size_t m2 = arena_.mark();
         QuantIn n = layernormQ(h, dm_.norm(b + ".norm1"));
-        Tensor q, k, v; linQ3(n, dm_.lin(b + ".attn1.to_qkv"), h.C, q, k, v);
-        AttnKV kv = quantKV(k, v, heads);
-        Tensor a = attention(q, kv, heads, false, q.T);
+        Tensor a;
+        if (cfg_.fusedAttention && useHl(dm_.lin(b + ".attn1.to_qkv"))) {
+            HeadQ qh, kh; Tensor v; linQ3H(n, dm_.lin(b + ".attn1.to_qkv"), h.C, heads, h.T, qh, kh, v);
+            AttnKV kv = quantKVH(kh, v, heads);
+            a = attentionH(qh, kv, heads, false, h.T, h.C);
+        } else {
+            Tensor q, k, v; linQ3(n, dm_.lin(b + ".attn1.to_qkv"), h.C, q, k, v);
+            AttnKV kv = quantKV(k, v, heads);
+            a = attention(q, kv, heads, false, q.T);
+        }
         linX(a, dm_.lin(b + ".attn1.to_out.0"), h.d, h.d);
         arena_.release(m2);
     }
@@ -439,10 +485,17 @@ Tensor Engine::textEncoder(const std::vector<int>& ids) {
         std::string p = "te.layers." + std::to_string(l);
         size_t mk = arena_.mark();
         QuantIn n = layernormQ(x, dm_.norm(p + ".layer_norm1"));
-        Tensor q, k, v; linQ3(n, dm_.lin(p + ".self_attn.qkv"), D, q, k, v);
-        k.T = T; v.T = T;                    // only the 77 real rows are keys/values
-        AttnKV kv = quantKV(k, v, 16);
-        Tensor a = attention(q, kv, 16, true, T);
+        Tensor a;
+        if (cfg_.fusedAttention && useHl(dm_.lin(p + ".self_attn.qkv"))) {
+            HeadQ qh, kh; Tensor v; linQ3H(n, dm_.lin(p + ".self_attn.qkv"), D, 16, T, qh, kh, v);   // Treal = 77 (rows 77..95 of x are padding)
+            AttnKV kv = quantKVH(kh, v, 16);
+            a = attentionH(qh, kv, 16, true, T, D);
+        } else {
+            Tensor q, k, v; linQ3(n, dm_.lin(p + ".self_attn.qkv"), D, q, k, v);
+            k.T = T; v.T = T;                    // only the 77 real rows are keys/values
+            AttnKV kv = quantKV(k, v, 16);
+            a = attention(q, kv, 16, true, T);
+        }
         linX(a, dm_.lin(p + ".self_attn.out_proj"), x.d, x.d);
         arena_.release(mk); mk = arena_.mark();
         QuantIn n2 = layernormQ(x, dm_.norm(p + ".layer_norm2"));

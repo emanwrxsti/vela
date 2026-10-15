@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 namespace meow {
-enum GemmEpi { EPI_PLAIN = 0, EPI_SPLIT3 = 1, EPI_GEGLU = 2, EPI_GELU = 3 };   // GELU: y = sat32(rshr(y*phi(y),16)) (text fc1)
+enum GemmEpi { EPI_PLAIN = 0, EPI_SPLIT3 = 1, EPI_GEGLU = 2, EPI_GELU = 3, EPI_QKV = 4 };   // QKV: q,k written head-quantised (k_quant_heads layout), v as int32 (64x64 tiles only)   // GELU: y = sat32(rshr(y*phi(y),16)) (text fc1)
 enum GemmSrc { SRC_I8 = 0, SRC_X32 = 1, SRC_CONV32 = 2 };
 /** A operand description. SRC_I8: planar int8 hi/lo rows (ld8) + per-row e. SRC_X32: int32 X[row, k] (ldx) quantised on load with
  *  e = row_exp(rowmax[row]). SRC_CONV32: NHWC int32 image, implicit 3x3/pad-1 im2col (K = 9C, C % 16 == 0), e[row] precomputed (k_conv_e). */
@@ -19,6 +19,9 @@ struct AEpi {
     int epi = EPI_PLAIN; int32_t* Y = nullptr; int ldy = 0; const int32_t* residual = nullptr;
     int Cs = 0; int32_t* Y1 = nullptr; int32_t* Y2 = nullptr; const int32_t* Lphi = nullptr;
     uint32_t* rowmax = nullptr;              // optional: atomicMax of |y| per output row (feeds a SRC_X32 consumer)
+    // EPI_QKV: N = 3*C, C = heads*64, rows = B*T. q -> (qhi,qlo,qe,qhs,qls,qts) with Tp = TpQ, k -> (khi,...) with Tp = TpK, v -> Y2 [rows, C]
+    int heads = 0, T = 0, TpQ = 0, TpK = 0, C = 0;
+    int8_t *qhi = nullptr, *qlo = nullptr, *khi = nullptr, *klo = nullptr; int32_t *qe = nullptr, *ke = nullptr; int64_t *qhs = nullptr, *qls = nullptr, *qts = nullptr, *khs = nullptr, *kls = nullptr, *kts = nullptr;
 };
 void k_gemm_hl2(cudaStream_t st, const ASrc& A, int Mp, int Mreal, const int8_t* W, int ldw, int Np, int Nreal, int Kp, const int4* cst, const AEpi& E);
 /** e[row] = row_exp(max over the 3x3 window of pm) for the implicit-im2col source (rows = B*Ho*Wo). */

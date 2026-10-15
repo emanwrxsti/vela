@@ -16,6 +16,14 @@ __host__ __device__ __forceinline__ i64 rshr(i64 v, i64 s) {
     return sat32(r * (1LL << neg));
 }
 __host__ __device__ __forceinline__ i64 floor_div(i64 a, i64 b) { i64 q = a / b; if ((a % b != 0) && ((a < 0) != (b < 0))) --q; return q; }
+/** Exact floor(a / b) for b > 0 using a precomputed double reciprocal (inv = 1.0/b) and an integer correction: |a| < 2^52. */
+__device__ __forceinline__ i64 floor_div_r(i64 a, i64 b, double inv) {
+    i64 q = i64(__double2ll_rd(double(a) * inv));
+    i64 r = a - q * b;
+    if (r < 0) { --q; r += b; if (r < 0) { --q; r += b; } }
+    else if (r >= b) { ++q; r -= b; if (r >= b) { ++q; } }
+    return q;
+}
 /** e = number of k in [15,32) with m >= 2^k  ==  max(0, bitlen(m) - 15) for m < 2^32. */
 __host__ __device__ __forceinline__ int row_exp(i64 m) { int e = 0; for (int k = 15; k < 32; ++k) e += (m >= (1LL << k)); return e; }
 __host__ __device__ __forceinline__ i64 quant16(i64 v, int e) { i64 q = rshr(v, e); return q < -32767 ? -32767 : (q > 32767 ? 32767 : q); }

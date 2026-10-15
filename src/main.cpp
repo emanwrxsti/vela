@@ -120,14 +120,17 @@ static int runBench(const Opts& o, const Poisd& model, const std::vector<int>& d
             std::vector<std::unique_ptr<Engine>> lanes; for (int l = 0; l < o.lanes; ++l) { lanes.emplace_back(new Engine(dm, cfg)); lanes.back()->setPrompt(tokens); }
             std::vector<std::thread> lt; std::atomic<uint64_t> devTotal{0};
             // warm-up (graph capture + cuBLASLt autotune) is excluded from the timed window
-            { std::vector<uint8_t> seeds(size_t(o.batch) * 32, 7), x0(size_t(o.batch) * 32768); for (auto& e : lanes) { e->run(seeds.data(), x0.data()); e->run(seeds.data(), x0.data()); } }
+            { std::vector<uint8_t> seeds(size_t(o.batch) * 32, 7), x0(size_t(o.batch) * 32768); for (auto& e : lanes) { e->submit(seeds.data()); e->submit(seeds.data()); e->collect(x0.data()); e->collect(x0.data()); } }   // both pipeline slots captured
             cudaProfilerStart();                       // nsys --capture-range=cudaProfilerApi: profile only the steady state
             auto td = std::chrono::steady_clock::now();
             for (int l = 0; l < o.lanes; ++l) lt.emplace_back([&, l] {
                 std::mt19937_64 rng(dev * 100 + l); std::vector<uint8_t> seeds(size_t(o.batch) * 32), x0(size_t(o.batch) * 32768);
+                // two batches in flight per lane: the GPU never waits for the host-side hashing / copies
+                for (auto& b : seeds) b = uint8_t(rng());
+                lanes[l]->submit(seeds.data());
                 for (int it = 0; it < o.benchIters; ++it) {
-                    for (auto& b : seeds) b = uint8_t(rng());
-                    lanes[l]->run(seeds.data(), x0.data());
+                    if (it + 1 < o.benchIters) { for (auto& b : seeds) b = uint8_t(rng()); lanes[l]->submit(seeds.data()); }
+                    lanes[l]->collect(x0.data());
                     for (int b = 0; b < o.batch; ++b) { auto s = std::array<uint8_t, 32>{}; std::memcpy(s.data(), &seeds[b * 32], 32); poiOut(s, &x0[b * 32768]); }
                     devTotal += o.batch; total += o.batch;
                 }
@@ -215,6 +218,7 @@ static void mineLane(const Opts& o, const DevModel& dm, EngineConfig cfg, Stratu
         std::vector<std::array<uint8_t, 32>> seedArr(B);
         std::vector<std::array<uint8_t, 80>> headers(B);
         uint64_t lastGen = 0; Job job; uint8_t tmpl[80]; bool have = false; uint32_t nonce = uint32_t(lane) << 28; std::string en2Hex;
+        Job pendJob; std::vector<std::array<uint8_t, 80>> pendHeaders(B); std::vector<std::array<uint8_t, 32>> pendSeeds(B);
         { char b[16]; std::snprintf(b, sizeof(b), "%08x", en2); en2Hex = b; }
         bool warned = false;
         while (!g_stop) {
@@ -231,25 +235,33 @@ static void mineLane(const Opts& o, const DevModel& dm, EngineConfig cfg, Stratu
                 if (!have || j.promptTokens != job.promptTokens) { auto t0 = std::chrono::steady_clock::now(); eng.setPrompt(j.promptTokens); logln(tag + "prompt set (" + std::to_string(j.promptTokens.size()) + " tokens, " + std::to_string(int(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count())) + " ms)"); }
                 job = j; lastGen = j.generation; have = true;
             }
-            for (int b = 0; b < B; ++b) {
-                std::memcpy(headers[b].data(), tmpl, 76); uint32_t n = nonce++; headers[b][76] = n; headers[b][77] = n >> 8; headers[b][78] = n >> 16; headers[b][79] = n >> 24;
-                seedArr[b] = poiSeed(headers[b].data(), modelHashU256); std::memcpy(&seeds[b * 32], seedArr[b].data(), 32);
-            }
-            eng.run(seeds.data(), x0.data());
+            // batch k is submitted while batch k-1 is being verified/hashed on the host (two in flight per lane)
+            auto prepare = [&](std::vector<std::array<uint8_t, 80>>& hdrs, std::vector<std::array<uint8_t, 32>>& sds, std::vector<uint8_t>& sbuf) {
+                for (int b = 0; b < B; ++b) {
+                    std::memcpy(hdrs[b].data(), tmpl, 76); uint32_t n = nonce++; hdrs[b][76] = n; hdrs[b][77] = n >> 8; hdrs[b][78] = n >> 16; hdrs[b][79] = n >> 24;
+                    sds[b] = poiSeed(hdrs[b].data(), modelHashU256); std::memcpy(&sbuf[b * 32], sds[b].data(), 32);
+                }
+            };
+            if (eng.inFlight() == 0) { prepare(headers, seedArr, seeds); eng.submit(seeds.data()); pendJob = job; pendHeaders = headers; pendSeeds = seedArr; }
+            // next batch on the current job
+            prepare(headers, seedArr, seeds); eng.submit(seeds.data());
+            // collect the previous batch (belongs to pendJob)
+            eng.collect(x0.data());
             ls.inferences += B;
             for (int b = 0; b < B; ++b) {
-                auto hp = poiOut(seedArr[b], &x0[b * 32768]);
-                uint8_t h112[112]; std::memcpy(h112, headers[b].data(), 80); std::memcpy(h112 + 80, hp.data(), 32);
+                auto hp = poiOut(pendSeeds[b], &x0[b * 32768]);
+                uint8_t h112[112]; std::memcpy(h112, pendHeaders[b].data(), 80); std::memcpy(h112 + 80, hp.data(), 32);
                 auto hash = sha256d(h112, 112);
                 double d = hashDifficulty(hash.data());
                 double best = ls.bestDiff.load(); while (d > best && !ls.bestDiff.compare_exchange_weak(best, d)) {}
-                if (hashMeetsTarget(hash.data(), job.target)) {
-                    uint32_t n = uint32_t(headers[b][76]) | (uint32_t(headers[b][77]) << 8) | (uint32_t(headers[b][78]) << 16) | (uint32_t(headers[b][79]) << 24);
+                if (hashMeetsTarget(hash.data(), pendJob.target)) {
+                    uint32_t n = uint32_t(pendHeaders[b][76]) | (uint32_t(pendHeaders[b][77]) << 8) | (uint32_t(pendHeaders[b][78]) << 16) | (uint32_t(pendHeaders[b][79]) << 24);
                     char nb[16]; std::snprintf(nb, sizeof(nb), "%08x", n);
-                    client.submit(job.id, en2Hex, job.ntimeHex, nb, hex(&x0[b * 32768], 32768), hex(hp.data(), 32));
-                    logln(tag + "share found, diff " + std::to_string((long long)d) + " (job " + job.id + ", target " + std::to_string((long long)job.difficulty) + ")");
+                    client.submit(pendJob.id, en2Hex, pendJob.ntimeHex, nb, hex(&x0[b * 32768], 32768), hex(hp.data(), 32));
+                    logln(tag + "share found, diff " + std::to_string((long long)d) + " (job " + pendJob.id + ", target " + std::to_string((long long)pendJob.difficulty) + ")");
                 }
             }
+            pendJob = job; pendHeaders = headers; pendSeeds = seedArr;
         }
     } catch (const std::exception& e) { logln(tag + "FATAL " + e.what()); g_stop = true; }
 }

@@ -63,6 +63,10 @@ public:
     void setPrompt(const std::vector<int>& tokens);
     /** seeds: batch x 32 bytes -> x0: batch x 32768 bytes. First call runs eagerly and captures the graph. */
     void run(const uint8_t* seeds, uint8_t* x0);
+    /** Pipelined form: submit() enqueues a batch (up to 2 in flight, each with its own I/O buffers and graph), collect() waits for the oldest. */
+    void submit(const uint8_t* seeds);
+    void collect(uint8_t* x0);
+    int inFlight() const { return inflight_; }
     int batch() const { return cfg_.batch; }
     size_t arenaPeak() const { return arena_.peak; }
     cudaStream_t stream() const { return st_; }
@@ -74,6 +78,9 @@ private:
     Arena arena_; std::vector<void*> persist_;
     cudaGraphExec_t gexec_ = nullptr; bool captured_ = false;
     uint8_t *dSeeds_ = nullptr, *dOut_ = nullptr, *hSeeds_ = nullptr, *hOut_ = nullptr;
+    // pipelining: slot 1 has its own I/O buffers, graph and event; slot 0 reuses the members above
+    cudaGraphExec_t gexecS_[2] = {nullptr, nullptr}; uint8_t *dSeedsS_[2] = {nullptr, nullptr}, *dOutS_[2] = {nullptr, nullptr}, *hSeedsS_[2] = {nullptr, nullptr}, *hOutS_[2] = {nullptr, nullptr};
+    cudaEvent_t evDone_[2] = {nullptr, nullptr}; int inflight_ = 0; int subSlot_ = 0, colSlot_ = 0;
     int32_t *dNoise_ = nullptr, *dX_ = nullptr, *dEps_ = nullptr, *dIds_ = nullptr;
     cudaEvent_t ev0_ = nullptr, ev1_ = nullptr;
     std::map<std::string, AttnKV> crossKV_;      // per transformer block prefix (replicated for batch)
@@ -112,5 +119,7 @@ private:
     void unet(const Tensor& x, Tensor& eps);
     Tensor textEncoder(const std::vector<int>& ids);
     void forward();
+    void forwardIO(uint8_t* hSeeds, uint8_t* dSeeds, uint8_t* dOut, uint8_t* hOut);
+    void ensureSlot(int slot);
 };
 }  // namespace meow

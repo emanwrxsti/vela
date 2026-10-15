@@ -129,6 +129,8 @@ Engine::Engine(const DevModel& dm, const EngineConfig& cfg) : dm_(dm), cfg_(cfg)
 Engine::~Engine() {
     cudaStreamSynchronize(st_);
     if (gexec_) cudaGraphExecDestroy(gexec_);
+    for (int i = 0; i < 2; ++i) { if (gexecS_[i]) cudaGraphExecDestroy(gexecS_[i]); if (evDone_[i]) cudaEventDestroy(evDone_[i]); }
+    if (hSeedsS_[1]) cudaFreeHost(hSeedsS_[1]); if (hOutS_[1]) cudaFreeHost(hOutS_[1]);
     for (void* p : persist_) cudaFree(p);
     if (hSeeds_) cudaFreeHost(hSeeds_); if (hOut_) cudaFreeHost(hOut_);
     if (ev0_) cudaEventDestroy(ev0_); if (ev1_) cudaEventDestroy(ev1_);
@@ -592,16 +594,55 @@ long Engine::testAttention(int B, int Tq, int Tk, int heads, bool causal, int sc
     if (bad) { size_t i = size_t(firstBad); std::printf("  first mismatch at [b=%zu t=%zu c=%zu]: ref %d got %d\n", i / (size_t(Tq) * C), (i / C) % Tq, i % C, hr[i], hg[i]); }
     return bad;
 }
-void Engine::forward() {
+void Engine::forward() { forwardIO(hSeeds_, dSeeds_, dOut_, hOut_); }
+void Engine::forwardIO(uint8_t* hSeeds, uint8_t* dSeeds, uint8_t* dOut, uint8_t* hOut) {
     int B = cfg_.batch;
-    CUDA_CHECK(cudaMemcpyAsync(dSeeds_, hSeeds_, 32 * B, cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaMemcpyAsync(dSeeds, hSeeds, 32 * B, cudaMemcpyHostToDevice, st_));
     arena_.reset();
-    k_noise(st_, dSeeds_, B, dm_.lutGauss, dm_.cCin, dNoise_, dX_);
+    k_noise(st_, dSeeds, B, dm_.lutGauss, dm_.cCin, dNoise_, dX_);
     Tensor x; x.d = dX_; x.B = B; x.T = 4096; x.C = 4;
     Tensor eps; eps.d = dEps_; eps.B = B; eps.T = 4096; eps.C = 4;
     unet(x, eps);
-    k_finalize(st_, dNoise_, dEps_, B, dm_.cSig, dOut_);
-    CUDA_CHECK(cudaMemcpyAsync(hOut_, dOut_, 32768 * B, cudaMemcpyDeviceToHost, st_));
+    k_finalize(st_, dNoise_, dEps_, B, dm_.cSig, dOut);
+    CUDA_CHECK(cudaMemcpyAsync(hOut, dOut, 32768 * B, cudaMemcpyDeviceToHost, st_));
+}
+void Engine::ensureSlot(int slot) {
+    if (gexecS_[slot]) return;
+    const int B = cfg_.batch;
+    if (slot == 0) { dSeedsS_[0] = dSeeds_; dOutS_[0] = dOut_; hSeedsS_[0] = hSeeds_; hOutS_[0] = hOut_; }
+    else {
+        dSeedsS_[1] = (uint8_t*)palloc(32 * B); dOutS_[1] = (uint8_t*)palloc(32768 * B);
+        CUDA_CHECK(cudaHostAlloc((void**)&hSeedsS_[1], 32 * B, cudaHostAllocDefault)); CUDA_CHECK(cudaHostAlloc((void**)&hOutS_[1], 32768 * B, cudaHostAllocDefault));
+    }
+    CUDA_CHECK(cudaEventCreateWithFlags(&evDone_[slot], cudaEventDisableTiming));
+    if (!cfg_.graph) return;
+    // warm-up (plans/autotune) once, then capture a graph bound to this slot's buffers
+    forwardIO(hSeedsS_[slot], dSeedsS_[slot], dOutS_[slot], hOutS_[slot]);
+    CUDA_CHECK(cudaStreamSynchronize(st_)); CUDA_CHECK(cudaGetLastError());
+    cudaGraph_t g;
+    CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
+    forwardIO(hSeedsS_[slot], dSeedsS_[slot], dOutS_[slot], hOutS_[slot]);
+    CUDA_CHECK(cudaStreamEndCapture(st_, &g));
+    CUDA_CHECK(cudaGraphInstantiate(&gexecS_[slot], g, 0));
+    cudaGraphDestroy(g);
+}
+void Engine::submit(const uint8_t* seeds) {
+    if (!havePrompt_) throw std::runtime_error("submit: no prompt set");
+    if (inflight_ >= 2) throw std::runtime_error("submit: two batches already in flight");
+    CUDA_CHECK(cudaSetDevice(dm_.device));
+    const int slot = subSlot_; ensureSlot(slot);
+    std::memcpy(hSeedsS_[slot], seeds, 32 * cfg_.batch);
+    if (cfg_.graph) CUDA_CHECK(cudaGraphLaunch(gexecS_[slot], st_)); else forwardIO(hSeedsS_[slot], dSeedsS_[slot], dOutS_[slot], hOutS_[slot]);
+    CUDA_CHECK(cudaEventRecord(evDone_[slot], st_));
+    subSlot_ ^= 1; ++inflight_;
+}
+void Engine::collect(uint8_t* x0) {
+    if (inflight_ == 0) throw std::runtime_error("collect: nothing in flight");
+    const int slot = colSlot_;
+    CUDA_CHECK(cudaEventSynchronize(evDone_[slot]));
+    CUDA_CHECK(cudaGetLastError());
+    std::memcpy(x0, hOutS_[slot], 32768 * cfg_.batch);
+    colSlot_ ^= 1; --inflight_;
 }
 void Engine::run(const uint8_t* seeds, uint8_t* x0) {
     if (!havePrompt_) throw std::runtime_error("run: no prompt set");

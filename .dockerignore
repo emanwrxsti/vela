@@ -1,0 +1,9 @@
+.git
+build/
+build-*/
+dist/
+exp/
+logs/
+notes-private/
+*.poisd
+sd-turbo-int.poisd

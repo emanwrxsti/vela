@@ -1,0 +1,22 @@
+services:
+  miner:
+    image: ocminersupr/supr-meow-vela:0.1.0
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    environment:
+      WALLET: "vela1…YOUR_ADDRESS"
+      WORKER: "rig1"
+      # POOL_URL defaults to vela.suprnova.cc:7601
+      # DEVICES: "0"
+      # BATCH: "8"   # larger GPUs
+      # LANES: "2"
+    volumes:
+      - model-cache:/models
+volumes:
+  model-cache:

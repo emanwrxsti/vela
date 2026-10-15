@@ -330,6 +330,11 @@ int main(int argc, char** argv) {
             DevModel dm; dm.load(devs[0], model); EngineConfig cfg; cfg.batch = 2; cfg.graph = false; Engine eng(dm, cfg);
             struct T { int B, Tq, Tk, heads; bool causal; int bits; } tests[] = {{1, 64, 64, 1, false, 20}, {2, 96, 77, 16, true, 24}, {1, 256, 256, 2, false, 28}, {2, 1024, 64, 10, false, 30}, {2, 4096, 77, 5, false, 31}, {1, 4096, 4096, 5, false, 31}};
             int fails = 0;
+            for (int bits : {0, 14, 17, 20, 22, 23, 28, 31}) {
+                long bad = eng.testAttention(1, 65, 257, 2, false, bits);
+                logln("test-attn boundary scale=" + std::to_string(bits) + ": " + (bad ? std::to_string(bad) + " mismatches" : "OK"));
+                fails += bad != 0;
+            }
             for (auto& t : tests) { long bad = eng.testAttention(t.B, t.Tq, t.Tk, t.heads, t.causal, t.bits); logln("test-attn B=" + std::to_string(t.B) + " Tq=" + std::to_string(t.Tq) + " Tk=" + std::to_string(t.Tk) + " heads=" + std::to_string(t.heads) + (t.causal ? " causal" : "") + ": " + (bad ? std::to_string(bad) + " mismatches" : "OK")); fails += bad != 0; }
             return fails ? 1 : 0;
         }

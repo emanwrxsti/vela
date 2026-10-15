@@ -57,6 +57,11 @@ __device__ __forceinline__ int score(int hh, int T, int sh) {
     }
     if (sh >= 0) {             // hh*2^16 divisible by 2^sh: s = hh << (16-sh) + rshr(T, sh), saturated
         const int t = sh ? ((T >> sh) + ((T >> (sh - 1)) & 1)) : T;
+        // Quantised Q/K have 64 entries in [-32767,32767]. Thus
+        // |S| <= 64*32767^2 and round(S/2^sh) fits int32 for sh >= 5.
+        // The two terms may individually wrap (e.g. hh=64*128^2),
+        // so add as unsigned limbs; their final signed sum is in range.
+        if (sh >= 5) return int((unsigned(hh) << (16 - sh)) + unsigned(t));
         const i64 v = (i64(hh) << (16 - sh)) + t;
         return int(v < INT_MIN ? INT_MIN : (v > INT_MAX ? INT_MAX : v));
     }
@@ -109,7 +114,9 @@ __global__ void __launch_bounds__(NTHR, (TQ == 64 ? (PASS == 2 ? 2 : 3) : 1)) at
     if (PASS == 2) { i64 rr0 = gr[rowBase + row0], rr1 = gr[rowBase + row1]; r0lo = unsigned(rr0); r0hi = unsigned(rr0 >> 32); r1lo = unsigned(rr1); r1hi = unsigned(rr1 >> 32); }
     // passes 0/1 may skip fully-masked tiles; pass 2 must include every key tile (the 128*vsum correction assumes all keys went through the MMA with P = 0 = (0,-128)).
     const int nTiles = (PASS == 2 || !causal) ? Tkp / TK : min(Tkp / TK, (qt + 1) * (TQ / TK));
-    int mx0 = INT_MIN, mx1 = INT_MIN; i64 sum0 = 0, sum1 = 0, phs0 = 0, phs1 = 0, pls0 = 0, pls1 = 0;
+    int mx0 = INT_MIN, mx1 = INT_MIN; i64 sum0 = 0, sum1 = 0;
+    // At most 4096 keys: sums of signed byte planes fit comfortably in int32.
+    int phs0 = 0, phs1 = 0, pls0 = 0, pls1 = 0;
     int32_t o_hh[4][4], o_mx[4][4], o_ll[4][4];
     if (PASS == 2) for (int n = 0; n < 4; ++n) for (int j = 0; j < 4; ++j) { o_hh[n][j] = 0; o_mx[n][j] = 0; o_ll[n][j] = 0; }
     auto loadK = [&](int buf, int kt) {
@@ -134,15 +141,18 @@ __global__ void __launch_bounds__(NTHR, (TQ == 64 ? (PASS == 2 ? 2 : 3) : 1)) at
         // scores: this warp -> n-tiles kh*4 .. kh*4+3 (8 keys each), two n-tiles per scalar block for ILP
         constexpr int NU = 2;                                    // n-tiles per scalar block (4 spills at 80 regs and is slower)
         for (int np = 0; np < 4 / NU; ++np) {
-            int32_t hh[NU][4], hl[NU][4], lh[NU][4], ll[NU][4];
+            int32_t hh[NU][4], hl[NU][4], ll[NU][4];
             #pragma unroll
             for (int u = 0; u < NU; ++u) {
                 const int nt = kh * 4 + np * NU + u, kb = nt * 8;
-                for (int j = 0; j < 4; ++j) { hh[u][j] = 0; hl[u][j] = 0; lh[u][j] = 0; ll[u][j] = 0; }
+                for (int j = 0; j < 4; ++j) { hh[u][j] = 0; hl[u][j] = 0; ll[u][j] = 0; }
                 for (int ks = 0; ks < 2; ++ks) {
                     uint32_t bf[4];      // {bh0, bh1, bl0, bl1}: matrices 0/1 = K hi dims +0/+16, 2/3 = K lo
                     ldm4(bf, (lm < 2 ? Kh : Kl) + (kb + lr) * LD + ks * 32 + (lm & 1) * 16);
-                    mma_s8(hh[u], qa_hi[ks], bf[0], bf[1]); mma_s8(hl[u], qa_hi[ks], bf[2], bf[3]); mma_s8(lh[u], qa_lo[ks], bf[0], bf[1]); mma_s8(ll[u], qa_lo[ks], bf[2], bf[3]);
+                    // The cross products enter the score only as their sum.
+                    // Their combined magnitude is <= 2*64*128^2, so using
+                    // one int32 accumulator is exact and saves registers.
+                    mma_s8(hh[u], qa_hi[ks], bf[0], bf[1]); mma_s8(hl[u], qa_hi[ks], bf[2], bf[3]); mma_s8(hl[u], qa_lo[ks], bf[0], bf[1]); mma_s8(ll[u], qa_lo[ks], bf[2], bf[3]);
                 }
             }
             #pragma unroll
@@ -154,7 +164,7 @@ __global__ void __launch_bounds__(NTHR, (TQ == 64 ? (PASS == 2 ? 2 : 3) : 1)) at
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
                     const int kc = j & 1, key = key0 + kc; const bool r1 = j >= 2;
-                    const int T = ((hl[u][j] + lh[u][j]) << 8) + ll[u][j] + (r1 ? cq1 : cq0) + kk[kc];
+                    const int T = (hl[u][j] << 8) + ll[u][j] + (r1 ? cq1 : cq0) + kk[kc];
                     const bool valid = fullTile || (key < Tk && !(causal && key > (r1 ? qrow1 : qrow0)));
                     const int sv = valid ? score(hh[u][j], T, 19 - (r1 ? eq1 : eq0) - ekk[kc]) : INT_MIN;
                     if (PASS == 0) { if (r1) mx1 = max(mx1, sv); else mx0 = max(mx0, sv); }

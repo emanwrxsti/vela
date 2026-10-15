@@ -5,11 +5,17 @@
 #include <string>
 #include <vector>
 #include <array>
+#include <algorithm>
+#if defined(MEOW_HAVE_OPENSSL) && !defined(MEOW_PORTABLE_SHA256)
+#include <openssl/evp.h>
+#include <memory>
+#include <stdexcept>
+#endif
 
 namespace meow {
-class Sha256 {
+class PortableSha256 {
 public:
-    Sha256() { reset(); }
+    PortableSha256() { reset(); }
     void reset() { h_ = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au, 0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u}; len_ = 0; blen_ = 0; }
     void update(const void* data, size_t n) {
         const uint8_t* p = static_cast<const uint8_t*>(data);
@@ -27,7 +33,7 @@ public:
         std::array<uint8_t, 32> out; for (int i = 0; i < 8; ++i) { out[4*i] = h_[i] >> 24; out[4*i+1] = h_[i] >> 16; out[4*i+2] = h_[i] >> 8; out[4*i+3] = h_[i]; }
         return out;
     }
-    static std::array<uint8_t, 32> hash(const void* d, size_t n) { Sha256 s; s.update(d, n); return s.digest(); }
+    static std::array<uint8_t, 32> hash(const void* d, size_t n) { PortableSha256 s; s.update(d, n); return s.digest(); }
 private:
     static inline uint32_t rotr(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
     void block(const uint8_t* p) {
@@ -49,6 +55,30 @@ private:
     }
     std::array<uint32_t, 8> h_; uint64_t len_; uint8_t buf_[64]; size_t blen_;
 };
+
+#if defined(MEOW_HAVE_OPENSSL) && !defined(MEOW_PORTABLE_SHA256)
+// Use libcrypto's runtime CPU dispatch (including SHA extensions when present).
+// EVP preserves the portable backend on builds without OpenSSL, including Windows.
+class Sha256 {
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx_{EVP_MD_CTX_new(), EVP_MD_CTX_free};
+    static void check(int ok) { if (ok != 1) throw std::runtime_error("SHA256 EVP failure"); }
+public:
+    Sha256() { if (!ctx_) throw std::bad_alloc(); reset(); }
+    Sha256(const Sha256& other) : Sha256() { check(EVP_MD_CTX_copy_ex(ctx_.get(), other.ctx_.get())); }
+    Sha256& operator=(const Sha256& other) { if (this != &other) check(EVP_MD_CTX_copy_ex(ctx_.get(), other.ctx_.get())); return *this; }
+    void reset() { check(EVP_DigestInit_ex(ctx_.get(), EVP_sha256(), nullptr)); }
+    void update(const void* p, size_t n) { check(EVP_DigestUpdate(ctx_.get(), p, n)); }
+    std::array<uint8_t, 32> digest() {
+        std::array<uint8_t, 32> out; unsigned n = 0;
+        check(EVP_DigestFinal_ex(ctx_.get(), out.data(), &n));
+        if (n != out.size()) throw std::runtime_error("SHA256 digest length");
+        return out;
+    }
+    static std::array<uint8_t, 32> hash(const void* d, size_t n) { Sha256 s; s.update(d, n); return s.digest(); }
+};
+#else
+using Sha256 = PortableSha256;
+#endif
 
 inline std::array<uint8_t, 32> sha256(const void* d, size_t n) { return Sha256::hash(d, n); }
 inline std::array<uint8_t, 32> sha256d(const void* d, size_t n) { auto h = Sha256::hash(d, n); return Sha256::hash(h.data(), 32); }

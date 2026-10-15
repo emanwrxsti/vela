@@ -576,7 +576,7 @@ long Engine::testAttention(int B, int Tq, int Tk, int heads, bool causal, int sc
     int C = heads * 64;
     auto randTensor = [&](int T, uint32_t seed) {
         Tensor t = talloc(B, T, C); std::vector<int32_t> h(t.n()); uint64_t x = 0x9E3779B97F4A7C15ull ^ seed;
-        for (auto& v : h) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; int bits = 1 + int((x >> 40) % scaleBits); v = int32_t(int64_t(x & ((1ull << bits) - 1)) - (1ll << (bits - 1))); }
+        for (auto& v : h) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; if (scaleBits == 0) { v = 0; continue; } int bits = 1 + int((x >> 40) % scaleBits); v = int32_t(int64_t(x & ((1ull << bits) - 1)) - (1ll << (bits - 1))); }
         CUDA_CHECK(cudaMemcpyAsync(t.d, h.data(), t.n() * 4, cudaMemcpyHostToDevice, st_)); return t;
     };
     arena_.reset();

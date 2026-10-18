@@ -1,4 +1,4 @@
-supr-meow-vela 0.1.1 - native Windows x64 / NVIDIA CUDA
+supr-meow-vela 0.1.2 - native Windows x64 / NVIDIA CUDA
 
 Vela GPU miner (Proof-of-Inference v2, sd-turbo-int). Runs natively on Windows;
 WSL and Docker are not required. Use Windows 10/11 x64 and an NVIDIA Ampere or
@@ -16,7 +16,7 @@ PowerShell examples:
   .\start.ps1 -Wallet YOUR_VELA_WALLET -Devices '0,1'          # two GPUs
   .\start.ps1 -Wallet YOUR_VELA_WALLET -Batch 8 -Lanes 2       # larger GPUs
 
-It identifies itself to the pool as supr-meow-vela/0.1.1 and connects to
+It identifies itself to the pool as supr-meow-vela/0.1.2 and connects to
 vela.suprnova.cc:7601 unless you pass -Pool. This Windows build has no TLS
 (OpenSSL) support; use the plain-TCP port.
 

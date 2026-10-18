@@ -22,7 +22,7 @@
 
 using namespace meow;
 using json = nlohmann::json;
-static const char* VERSION_STR = "0.1.1";
+static const char* VERSION_STR = "0.1.2";
 static std::atomic<bool> g_stop{false};
 static std::atomic<bool> g_minerFailed{false};
 static std::mutex g_logmu;

@@ -12,9 +12,23 @@ is a real inference, verified by the pool with the same engine in `--verify-serv
 ## Download
 [GitHub Releases](https://github.com/ocminer/supr-meow-vela/releases) (and mirrored at https://vela.suprnova.cc/dl/):
 
-* `supr-meow-vela-0.1.1.tar.gz` — Linux x86-64 + bundled CUDA 13.3 runtime. One tarball serves **HiveOS** (`h-run.sh`), **MMPOS** (`mmpos-run.sh`) and **SMOS** (`smos-run.sh`) — pick the launcher for your OS; set `POOL_URL`, `WALLET` and (once) `MODEL_URL` in the flight sheet.
-* `supr-meow-vela-0.1.1-windows-x86_64.zip` — native **Windows** x64 build (no WSL/Docker). Edit `start.cmd` with your wallet and run it; the model downloads on first start. No TLS on Windows — use the plain-TCP port.
+* `supr-meow-vela-0.1.2.tar.gz` — Linux x86-64 + bundled CUDA 13.3 runtime. One tarball serves **HiveOS** (`h-run.sh`), **MMPOS** (`mmpos-run.sh`) and **SMOS** (`smos-run.sh`) — pick the launcher for your OS; set `POOL_URL` and `WALLET` in the flight sheet. The model downloads automatically if it is not cached.
+* `supr-meow-vela-0.1.2-windows-x86_64.zip` — native **Windows** x64 build (no WSL/Docker). Edit `start.cmd` with your wallet and run it; the model downloads on first start. No TLS on Windows — use the plain-TCP port.
 * `sd-turbo-int.poisd` — the model (~1.2 GB), plus `SHA256SUMS`.
+
+The model's primary URL is `https://vela.suprnova.cc/dl/sd-turbo-int.poisd`;
+`https://www.suprnova.cc/dl/sd-turbo-int.poisd` is its mirror. SHA-256:
+`ba38ab96b3398e22ea631d8a457350f91833e57463199d063663308513651f36`.
+For the published HiveOS 0.1.1 package, set `MODEL_URL` to either URL in the
+flight sheet's extra config; prefer the Vela URL.
+
+The HiveOS 0.1.2 launcher defaults to the Vela URL and tries the
+Suprnova mirror only if downloading or verifying the primary fails. Downloads
+are checksum-verified before caching; cached files are checked before mining.
+An explicit `MODEL_PATH` reuses a local file. `MODEL_URL` overrides the primary;
+for a custom URL, set `MODEL_FALLBACK_URL` explicitly if a mirror is wanted.
+Set `MODEL_FALLBACK_URL=""` to disable fallback. `MODEL_SHA256` can override the
+expected checksum for an explicitly selected model.
 
 ## Usage
 ```

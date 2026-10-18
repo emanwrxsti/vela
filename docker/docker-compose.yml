@@ -1,6 +1,6 @@
 services:
   miner:
-    image: ocminersupr/supr-meow-vela:0.1.1
+    image: ocminersupr/supr-meow-vela:0.1.2
     restart: unless-stopped
     deploy:
       resources:

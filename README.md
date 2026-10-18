@@ -12,8 +12,8 @@ is a real inference, verified by the pool with the same engine in `--verify-serv
 ## Download
 [GitHub Releases](https://github.com/ocminer/supr-meow-vela/releases) (and mirrored at https://vela.suprnova.cc/dl/):
 
-* `supr-meow-vela-0.1.0.tar.gz` — Linux x86-64 + bundled CUDA 13.3 runtime. One tarball serves **HiveOS** (`h-run.sh`), **MMPOS** (`mmpos-run.sh`) and **SMOS** (`smos-run.sh`) — pick the launcher for your OS; set `POOL_URL`, `WALLET` and (once) `MODEL_URL` in the flight sheet.
-* `supr-meow-vela-0.1.0-windows-x86_64.zip` — native **Windows** x64 build (no WSL/Docker). Edit `start.cmd` with your wallet and run it; the model downloads on first start. No TLS on Windows — use the plain-TCP port.
+* `supr-meow-vela-0.1.1.tar.gz` — Linux x86-64 + bundled CUDA 13.3 runtime. One tarball serves **HiveOS** (`h-run.sh`), **MMPOS** (`mmpos-run.sh`) and **SMOS** (`smos-run.sh`) — pick the launcher for your OS; set `POOL_URL`, `WALLET` and (once) `MODEL_URL` in the flight sheet.
+* `supr-meow-vela-0.1.1-windows-x86_64.zip` — native **Windows** x64 build (no WSL/Docker). Edit `start.cmd` with your wallet and run it; the model downloads on first start. No TLS on Windows — use the plain-TCP port.
 * `sd-turbo-int.poisd` — the model (~1.2 GB), plus `SHA256SUMS`.
 
 ## Usage
@@ -28,6 +28,8 @@ Measured (batch 8 × 2 lanes): RTX 5090 / RTX PRO 6000 ≈ 125–135 inf/s (575�
 ## Build
 CUDA 12.8+ (13.3 used for releases), CMake ≥ 3.24, gcc 13. `cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j`.
 Release tarballs ship `lib/libcudart.so.13` and `lib/libcublasLt.so.13` next to the binary (RPATH `$ORIGIN/lib`); the NVIDIA driver must be ≥ R580 (CUDA 13).
+The Linux packages require glibc 2.38 or newer and OpenSSL 3. The Docker image
+includes a compatible userspace for hosts with an older distribution.
 
 Build with `-DMEOW_BUILD_TESTS=ON` and run `ctest --test-dir build --output-on-failure` for CPU tests.
 With two available GPUs and the model installed, run

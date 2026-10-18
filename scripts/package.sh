@@ -4,7 +4,7 @@
 # Run on the build host after `cmake --build <build-dir>`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-VER=${1:-0.1.0}
+VER=${1:-0.1.1}
 BUILD=${BUILD_DIR:-build-release}
 CUDA=${CUDA_HOME:-/usr/local/cuda-13.3}
 D=dist/supr-meow-vela-$VER
@@ -13,6 +13,11 @@ rm -rf "$D"; mkdir -p "$D/lib"
 cp "$BUILD/supr-meow-vela" "$D/"; strip "$D/supr-meow-vela"
 cp "$CUDA/targets/x86_64-linux/lib/libcudart.so.13" "$CUDA/targets/x86_64-linux/lib/libcublasLt.so.13" "$D/lib/"
 cp README.md LICENSE NOTICE "$D/"
+cp RELEASE-v"$VER".md "$D/"
+mkdir -p "$D/licenses"
+cp "$CUDA/EULA.txt" "$D/licenses/NVIDIA-CUDA-EULA.txt"
+printf '{"version":"%s","source_commit":"%s","cuda":"13.3","architectures":[80,86,89,90,100,120]}\n' \
+  "$VER" "$(git rev-parse HEAD)" > "$D/BUILD-INFO.json"
 # HiveOS
 cp hiveos/h-config.sh hiveos/h-run.sh hiveos/h-stats.sh hiveos/h-manifest.conf "$D/"
 # MMPOS / SMOS
@@ -28,7 +33,8 @@ chmod +x "$D"/*.sh "$D/supr-meow-vela"
 
 # HiveOS also accepts a package dir named after the miner
 ( cd dist && rm -rf supr-meow-vela && cp -r "supr-meow-vela-$VER" supr-meow-vela \
-    && tar czf supr-meow-vela-hiveos.tar.gz supr-meow-vela && rm -rf supr-meow-vela )
+    && tar czf supr-meow-vela-hiveos.tar.gz supr-meow-vela && rm -rf supr-meow-vela \
+    && sha256sum supr-meow-vela-hiveos.tar.gz > supr-meow-vela-hiveos.tar.gz.sha256 )
 
 echo "== dist =="; ls -la dist/ | grep -E "$VER|hiveos"
 echo "== package contents =="; tar tzf "dist/supr-meow-vela-$VER.tar.gz"

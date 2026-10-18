@@ -4,23 +4,22 @@ FROM nvidia/cuda:${CUDA_IMAGE}-devel-ubuntu24.04 AS build
 ARG CUDA_ARCHS="80;86;89;90;100;120"
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake git ca-certificates \
+        build-essential cmake git ca-certificates libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY CMakeLists.txt /src/
 COPY src/           /src/src/
 COPY vendor/        /src/vendor/
-# No OpenSSL in the image -> TLS disabled (pool default port is plain TCP).
+# OpenSSL supplies TLS and CPU-dispatched SHA-256.
 RUN cmake -B build -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
-      -DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON \
  && cmake --build build -j"$(nproc)" --target supr-meow-vela \
  && strip build/supr-meow-vela
 
 FROM nvidia/cuda:${CUDA_IMAGE}-runtime-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl libgomp1 openssh-server \
+        ca-certificates curl libgomp1 libssl3 openssh-server \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /src/build/supr-meow-vela /app/

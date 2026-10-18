@@ -1,0 +1,24 @@
+# Release image: use the exact qualified Linux package and its CUDA runtime.
+# Build context contains dist/supr-meow-vela-<version>/ and docker/entrypoint.sh.
+FROM ubuntu:24.04
+ARG VERSION=0.1.1
+ARG SOURCE_COMMIT
+LABEL org.opencontainers.image.title="supr-meow-vela" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      org.opencontainers.image.source="https://github.com/ocminer/supr-meow-vela"
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl libgomp1 libssl3 openssh-server \
+    && rm -rf /var/lib/apt/lists/* /etc/ssh/ssh_host_*
+WORKDIR /app
+COPY dist/supr-meow-vela-${VERSION}/ /app/
+COPY docker/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh /app/supr-meow-vela && mkdir -p /models
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    NVIDIA_REQUIRE_CUDA="cuda>=13.0" \
+    LD_LIBRARY_PATH=/app/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+VOLUME ["/models"]
+EXPOSE 22
+ENTRYPOINT ["/app/entrypoint.sh"]

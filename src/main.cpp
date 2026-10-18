@@ -12,6 +12,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <random>
 #include <thread>
@@ -23,6 +24,7 @@ using namespace meow;
 using json = nlohmann::json;
 static const char* VERSION_STR = "0.1.0";
 static std::atomic<bool> g_stop{false};
+static std::atomic<bool> g_minerFailed{false};
 static std::mutex g_logmu;
 static void logln(const std::string& s) {
     std::lock_guard<std::mutex> l(g_logmu);
@@ -49,7 +51,7 @@ static void usage() {
         "      --score-mb MB        attention score budget per lane (default 256)\n"
         "      --suggest-diff D     send mining.suggest_difficulty after connect\n"
         "      --no-graph           run eagerly (debug)\n"
-        "      --check              verify the spec test vector and exit\n"
+        "      --check              verify the spec test vector on every selected GPU\n"
         "      --bench [N]          throughput benchmark\n"
         "      --seed HEX | --header HEX80  --tokens 320,736,3240 [--x0-out FILE]   single inference, print sha256(x0)/hashpoi\n"
         "      --verify-server --port 9010 --host 0.0.0.0   pool verifier (HTTP /verify, /health)\n";
@@ -109,6 +111,7 @@ namespace meow { void k_attn_stats_dump(); }
 static int runBench(const Opts& o, const Poisd& model, const std::vector<int>& devs) {
     std::vector<int> tokens = {320, 736, 3240};
     std::atomic<uint64_t> total{0};
+    std::atomic<bool> failed{false};
     std::vector<std::thread> ths; std::mutex mu;
     auto t0 = std::chrono::steady_clock::now();
     for (int dev : devs) ths.emplace_back([&, dev] {
@@ -119,28 +122,35 @@ static int runBench(const Opts& o, const Poisd& model, const std::vector<int>& d
             cfg.arenaBytes = o.memMB ? (o.memMB << 20) : (freeB - (768u << 20)) / o.lanes;
             std::vector<std::unique_ptr<Engine>> lanes; for (int l = 0; l < o.lanes; ++l) { lanes.emplace_back(new Engine(dm, cfg)); lanes.back()->setPrompt(tokens); }
             std::vector<std::thread> lt; std::atomic<uint64_t> devTotal{0};
+            std::exception_ptr laneError; std::mutex laneErrorMu;
             // warm-up (graph capture + cuBLASLt autotune) is excluded from the timed window
             { std::vector<uint8_t> seeds(size_t(o.batch) * 32, 7), x0(size_t(o.batch) * 32768); for (auto& e : lanes) { e->submit(seeds.data()); e->submit(seeds.data()); e->collect(x0.data()); e->collect(x0.data()); } }   // both pipeline slots captured
             cudaProfilerStart();                       // nsys --capture-range=cudaProfilerApi: profile only the steady state
             auto td = std::chrono::steady_clock::now();
             for (int l = 0; l < o.lanes; ++l) lt.emplace_back([&, l] {
-                std::mt19937_64 rng(dev * 100 + l); std::vector<uint8_t> seeds(size_t(o.batch) * 32), x0(size_t(o.batch) * 32768);
-                // two batches in flight per lane: the GPU never waits for the host-side hashing / copies
-                for (auto& b : seeds) b = uint8_t(rng());
-                lanes[l]->submit(seeds.data());
-                for (int it = 0; it < o.benchIters; ++it) {
-                    if (it + 1 < o.benchIters) { for (auto& b : seeds) b = uint8_t(rng()); lanes[l]->submit(seeds.data()); }
-                    lanes[l]->collect(x0.data());
-                    for (int b = 0; b < o.batch; ++b) { auto s = std::array<uint8_t, 32>{}; std::memcpy(s.data(), &seeds[b * 32], 32); poiOut(s, &x0[b * 32768]); }
-                    devTotal += o.batch; total += o.batch;
+                try {
+                    std::mt19937_64 rng(dev * 100 + l); std::vector<uint8_t> seeds(size_t(o.batch) * 32), x0(size_t(o.batch) * 32768);
+                    // two batches in flight per lane: the GPU never waits for the host-side hashing / copies
+                    for (auto& b : seeds) b = uint8_t(rng());
+                    lanes[l]->submit(seeds.data());
+                    for (int it = 0; it < o.benchIters; ++it) {
+                        if (it + 1 < o.benchIters) { for (auto& b : seeds) b = uint8_t(rng()); lanes[l]->submit(seeds.data()); }
+                        lanes[l]->collect(x0.data());
+                        for (int b = 0; b < o.batch; ++b) { auto s = std::array<uint8_t, 32>{}; std::memcpy(s.data(), &seeds[b * 32], 32); poiOut(s, &x0[b * 32768]); }
+                        devTotal += o.batch; total += o.batch;
+                    }
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(laneErrorMu);
+                    if (!laneError) laneError = std::current_exception();
                 }
             });
             for (auto& t : lt) t.join();
             cudaProfilerStop();
+            if (laneError) std::rethrow_exception(laneError);
             double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - td).count();
             std::lock_guard<std::mutex> l(mu);
             logln("GPU " + std::to_string(dev) + ": " + std::to_string(devTotal.load()) + " inferences in " + std::to_string(s) + " s = " + std::to_string(devTotal / s) + " inf/s (batch " + std::to_string(o.batch) + " x " + std::to_string(o.lanes) + " lanes, last step " + std::to_string(lanes[0]->lastMs) + " ms, arena peak " + std::to_string(lanes[0]->arenaPeak() >> 20) + " MiB)");
-        } catch (const std::exception& e) { logln("GPU " + std::to_string(dev) + " bench error: " + e.what()); }
+        } catch (const std::exception& e) { failed = true; logln("GPU " + std::to_string(dev) + " bench error: " + e.what()); }
     });
     for (auto& t : ths) t.join();
 #ifdef MEOW_ATTN_STATS
@@ -148,7 +158,7 @@ static int runBench(const Opts& o, const Poisd& model, const std::vector<int>& d
 #endif
     double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     logln("TOTAL " + std::to_string(total.load()) + " inferences, " + std::to_string(total / s) + " inf/s incl. setup");
-    return 0;
+    return failed ? 1 : 0;
 }
 
 // ------------------------------------------------------------------ verify server
@@ -263,7 +273,7 @@ static void mineLane(const Opts& o, const DevModel& dm, EngineConfig cfg, Stratu
             }
             pendJob = job; pendHeaders = headers; pendSeeds = seedArr;
         }
-    } catch (const std::exception& e) { logln(tag + "FATAL " + e.what()); g_stop = true; }
+    } catch (const std::exception& e) { logln(tag + "FATAL " + e.what()); g_minerFailed = true; g_stop = true; }
 }
 static int runMiner(const Opts& o, const Poisd& model, const std::vector<int>& devs) {
     if (o.url.empty() || o.wallet.empty()) { usage(); return 1; }
@@ -310,7 +320,7 @@ static int runMiner(const Opts& o, const Poisd& model, const std::vector<int>& d
     }
     client.stop();
     for (auto& t : ths) t.join();
-    return 0;
+    return g_minerFailed ? 1 : 0;
 }
 
 int main(int argc, char** argv) {
@@ -338,7 +348,15 @@ int main(int argc, char** argv) {
             for (auto& t : tests) { long bad = eng.testAttention(t.B, t.Tq, t.Tk, t.heads, t.causal, t.bits); logln("test-attn B=" + std::to_string(t.B) + " Tq=" + std::to_string(t.Tq) + " Tk=" + std::to_string(t.Tk) + " heads=" + std::to_string(t.heads) + (t.causal ? " causal" : "") + ": " + (bad ? std::to_string(bad) + " mismatches" : "OK")); fails += bad != 0; }
             return fails ? 1 : 0;
         }
-        if (o.check) { auto seed = sha256("x", 1); return runSingle(o, model, devs, seed, {320, 736, 3240}, "bef682cc9651fe8d42f075e98b907432f86a0b9e9a40e772fef99fc424f5c518"); }
+        if (o.check) {
+            auto seed = sha256("x", 1);
+            for (int dev : devs) {
+                logln("Checking GPU " + std::to_string(dev));
+                int rc = runSingle(o, model, {dev}, seed, {320, 736, 3240}, "bef682cc9651fe8d42f075e98b907432f86a0b9e9a40e772fef99fc424f5c518");
+                if (rc) return rc;
+            }
+            return 0;
+        }
         if (!o.headerHex.empty()) {
             auto hdr = unhex(o.headerHex); if (hdr.size() != 80) throw std::runtime_error("--header must be 80 bytes");
             auto seed = poiSeed(hdr.data(), model.model_hash_uint256());

@@ -1,4 +1,5 @@
 #include "gemm_hl.h"
+#include "common.h"
 #include "intops.cuh"
 #include "kernels.h"
 #include <cstdint>
@@ -274,8 +275,15 @@ typedef Cfg<64, 64, 4, 4> CfgSmall;     // 64x64 tile, 48 KB smem, 2 blocks/SM  
 typedef Cfg<128, 64, 4, 4> CfgTall;     // 128x64 tile, 80 KB smem, 1 block/SM   (large K: more reuse per byte)
 typedef Cfg<64, 128, 3, 2> CfgWide;     // 64x128 tile, 48 KB
 template <int EPI, int SRC, class C> void launch(dim3 grid, cudaStream_t st, const ASrc& A, int Mreal, const int8_t* W, int ldw, int Nreal, int Kp, const int4* cst, const AEpi& E) {
-    static bool attr = false;
-    if (!attr) { cudaFuncSetAttribute(gemm_hl_k<EPI, SRC, C>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM); attr = true; }
+    // A process-wide flag leaves every device after the first without its
+    // shared-memory opt-in. Cache by lane thread and current device instead.
+    static thread_local int attrDevice = -1;
+    int device = -1;
+    CUDA_CHECK(cudaGetDevice(&device));
+    if (attrDevice != device) {
+        CUDA_CHECK(cudaFuncSetAttribute(gemm_hl_k<EPI, SRC, C>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM));
+        attrDevice = device;
+    }
     gemm_hl_k<EPI, SRC, C><<<grid, NTHR, C::SMEM, st>>>(A, Mreal, W, ldw, Nreal, Kp, cst, E);
 }
 template <int SRC, class C> void launch_epi(int epi, dim3 grid, cudaStream_t st, const ASrc& A, int Mreal, const int8_t* W, int ldw, int Nreal, int Kp, const int4* cst, const AEpi& E) {

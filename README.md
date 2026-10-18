@@ -19,7 +19,7 @@ is a real inference, verified by the pool with the same engine in `--verify-serv
 ## Usage
 ```
 ./supr-meow-vela -o vela.suprnova.cc:7601 -u vela1…yourAddress.worker --model sd-turbo-int.poisd [--batch 8 --lanes 2] [--devices 0,1] [--tls]
-./supr-meow-vela --check                  # spec test vector (sha256(x0) = bef682cc…)
+./supr-meow-vela --check                  # spec test vector on every selected GPU (sha256(x0) = bef682cc…)
 ./supr-meow-vela --bench 20 --batch 8     # throughput
 ./supr-meow-vela --verify-server --port 9010 --mem 1024 --batch 1   # pool verifier (HTTP POST /verify, GET /health)
 ```
@@ -28,6 +28,11 @@ Measured (batch 8 × 2 lanes): RTX 5090 / RTX PRO 6000 ≈ 125–135 inf/s (575�
 ## Build
 CUDA 12.8+ (13.3 used for releases), CMake ≥ 3.24, gcc 13. `cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j`.
 Release tarballs ship `lib/libcudart.so.13` and `lib/libcublasLt.so.13` next to the binary (RPATH `$ORIGIN/lib`); the NVIDIA driver must be ≥ R580 (CUDA 13).
+
+Build with `-DMEOW_BUILD_TESTS=ON` and run `ctest --test-dir build --output-on-failure` for CPU tests.
+With two available GPUs and the model installed, run
+`python3 tests/multi_gpu.py --miner ./build/supr-meow-vela --model sd-turbo-int.poisd --devices 0,1`.
+This checks the consensus vector across devices in both orders, eager and graph execution, and concurrent mining lanes.
 
 ## Protocol
 Named-params JSON-RPC stratum, see `VELA-STRATUM-PROTOCOL.md` in the pool repo (`mining.subscribe` / `mining.authorize` /

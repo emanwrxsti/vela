@@ -46,10 +46,10 @@ jobs:
             '-DCMAKE_CUDA_ARCHITECTURES=80;86;89;90;100;120' `
             '-DCMAKE_CUDA_FLAGS=--diag-suppress=177 --diag-suppress=550'
           if ($LASTEXITCODE) { throw 'CMake configure failed' }
-      - name: Build and run CPU self-test (target math + native sockets)
+      - name: Build and run CPU self-tests (SHA-256, target math, native sockets)
         shell: pwsh
         run: |
-          cmake --build build/windows --parallel 4 --target meow-net-test
+          cmake --build build/windows --parallel 4 --target meow-net-test meow-sha-test
           if ($LASTEXITCODE) { throw 'Self-test build failed' }
           ctest --test-dir build/windows --output-on-failure
           if ($LASTEXITCODE) { throw 'CPU self-test failed (target math or native sockets)' }

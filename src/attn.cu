@@ -5,6 +5,7 @@
 // Block = 64 queries x one (batch, head); 8 warps: warp w -> query rows (w&3)*16.., key half (w>>2) of each 64-key tile;
 // in the PV stage warp w -> rows (w&3)*16, output dims (w>>2)*32... Passes 0/1 need few registers/smem -> high occupancy.
 #include "kernels.h"
+#include "common.h"
 #include "intops.cuh"
 #include <climits>
 #include <stdexcept>
@@ -252,12 +253,17 @@ void k_fused_attention(cudaStream_t st, const int8_t* qhi, const int8_t* qlo, co
                        const int8_t* vthi, const int8_t* vtlo, const int32_t* ev, const i64* vsum,
                        int B, int heads, int Tq, int Tqp, int Tk, int Tkp, bool causal, const i64* Lexp, int C, int32_t* gmx, i64* gr, int32_t* out, uint32_t* rowmax) {
     if (Tqp % TQ || Tkp % 64) throw std::runtime_error("fused attention: Tqp/Tkp alignment");
-    static bool attrSet = false;
-    if (!attrSet) {
-        cudaFuncSetAttribute(attn_pass_k<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(SMEM0));
-        cudaFuncSetAttribute(attn_pass_k<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(SMEM1));
-        cudaFuncSetAttribute(attn_pass_k<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(SMEM2));
-        attrSet = true;
+    // Kernel attributes belong to the current device, not the whole process.
+    // Each lane has its own cache, avoiding a host data race; reconfigure when
+    // the same thread switches devices (e.g. checking several GPUs in order).
+    static thread_local int attrDevice = -1;
+    int device = -1;
+    CUDA_CHECK(cudaGetDevice(&device));
+    if (attrDevice != device) {
+        CUDA_CHECK(cudaFuncSetAttribute(attn_pass_k<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(SMEM0)));
+        CUDA_CHECK(cudaFuncSetAttribute(attn_pass_k<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(SMEM1)));
+        CUDA_CHECK(cudaFuncSetAttribute(attn_pass_k<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(SMEM2)));
+        attrDevice = device;
     }
     dim3 grid(Tqp / TQ, B * heads);
     attn_pass_k<0><<<grid, NTHR, SMEM0, st>>>(qhi, qlo, eq, qhs, qls, khi, klo, ek, ksum, vthi, vtlo, ev, vsum, Tq, Tqp, Tk, Tkp, causal, Lexp, heads, C, gmx, gr, out, rowmax);

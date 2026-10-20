@@ -22,7 +22,7 @@
 
 using namespace meow;
 using json = nlohmann::json;
-static const char* VERSION_STR = "0.1.3";
+static const char* VERSION_STR = "0.1.4";
 static std::atomic<bool> g_stop{false};
 static std::atomic<bool> g_minerFailed{false};
 static std::mutex g_logmu;
@@ -233,11 +233,11 @@ static void mineLane(const Opts& o, const DevModel& dm, EngineConfig cfg, Stratu
         bool warned = false;
         while (!g_stop) {
             Job j;
-            if (!client.currentJob(j) || client.extranonce1Hex().empty()) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); continue; }
+            if (!client.currentJob(j)) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); continue; }
             if (j.generation != lastGen) {
                 if (!j.modelHash.empty() && j.modelHash != modelHashNat) { if (!warned) { logln(tag + "job model_hash " + j.modelHash + " != loaded model " + modelHashNat + " — refusing to mine"); warned = true; } std::this_thread::sleep_for(std::chrono::seconds(5)); continue; }
                 // coinbase + merkle root with our extranonce
-                std::vector<uint8_t> cb = j.coinbase1; auto en1 = unhex(client.extranonce1Hex()); cb.insert(cb.end(), en1.begin(), en1.end()); auto e2 = unhex(en2Hex); cb.insert(cb.end(), e2.begin(), e2.end()); cb.insert(cb.end(), j.coinbase2.begin(), j.coinbase2.end());
+                std::vector<uint8_t> cb = j.coinbase1; auto en1 = unhex(j.extranonce1Hex); cb.insert(cb.end(), en1.begin(), en1.end()); auto e2 = unhex(en2Hex); cb.insert(cb.end(), e2.begin(), e2.end()); cb.insert(cb.end(), j.coinbase2.begin(), j.coinbase2.end());
                 auto root = sha256d(cb.data(), cb.size());
                 for (auto& br : j.branch) { uint8_t buf[64]; std::memcpy(buf, root.data(), 32); std::memcpy(buf + 32, br.data(), 32); root = sha256d(buf, 64); }
                 auto le32 = [](uint8_t* p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; };
@@ -267,7 +267,7 @@ static void mineLane(const Opts& o, const DevModel& dm, EngineConfig cfg, Stratu
                 if (hashMeetsTarget(hash.data(), pendJob.target)) {
                     uint32_t n = uint32_t(pendHeaders[b][76]) | (uint32_t(pendHeaders[b][77]) << 8) | (uint32_t(pendHeaders[b][78]) << 16) | (uint32_t(pendHeaders[b][79]) << 24);
                     char nb[16]; std::snprintf(nb, sizeof(nb), "%08x", n);
-                    client.submit(pendJob.id, en2Hex, pendJob.ntimeHex, nb, hex(&x0[b * 32768], 32768), hex(hp.data(), 32));
+                    client.submit(pendJob, en2Hex, pendJob.ntimeHex, nb, hex(&x0[b * 32768], 32768), hex(hp.data(), 32));
                     logln(tag + "share found, diff " + std::to_string((long long)d) + " (job " + pendJob.id + ", target " + std::to_string((long long)pendJob.difficulty) + ")");
                 }
             }

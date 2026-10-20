@@ -21,6 +21,8 @@ struct Job {
     int height = 0; bool clean = false; int poiVersion = 2;
     double difficulty = 0;                      // difficulty in effect when the job was issued
     uint64_t generation = 0;                    // increases on every notify
+    uint64_t connectionId = 0;                  // never reused by this client
+    std::string extranonce1Hex;                 // belongs to this job's connection
     uint32_t version = 0, ntime = 0, bits = 0;
     std::array<uint8_t, 32> prevHashLE{};       // internal byte order (as it goes into the header)
     std::array<uint8_t, 32> target{};           // share target, little-endian 256-bit
@@ -41,7 +43,7 @@ public:
     std::string extranonce1Hex() const { std::lock_guard<std::mutex> l(mu_); return extranonce1_; }
     std::string modelHash() const { std::lock_guard<std::mutex> l(mu_); return modelHash_; }
     /** Submit a share; result delivered asynchronously via stats + log. */
-    void submit(const std::string& jobId, const std::string& extranonce2Hex, const std::string& ntimeHex, const std::string& nonceHex, const std::string& x0Hex, const std::string& hashpoiHex);
+    void submit(const Job& job, const std::string& extranonce2Hex, const std::string& ntimeHex, const std::string& nonceHex, const std::string& x0Hex, const std::string& hashpoiHex);
     void suggestDifficulty(double d);
     StratumStats stats;
     std::function<void(const std::string&)> log = [](const std::string&) {};
@@ -67,6 +69,7 @@ private:
     std::mutex wmu_; std::atomic<int> nextId_{10};
     std::chrono::steady_clock::time_point lastRx_{}, lastPing_{};
     std::set<std::string> connJobs_;             // job ids issued on the current connection
+    uint64_t connectionId_ = 0;                 // protected by mu_; transition also holds wmu_
     std::map<int, std::string> pending_;         // id -> method
     std::string suggestDiff_;                    // sent after authorize if set
 };

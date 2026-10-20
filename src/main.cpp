@@ -22,7 +22,7 @@
 
 using namespace meow;
 using json = nlohmann::json;
-static const char* VERSION_STR = "0.1.2";
+static const char* VERSION_STR = "0.1.3";
 static std::atomic<bool> g_stop{false};
 static std::atomic<bool> g_minerFailed{false};
 static std::mutex g_logmu;
@@ -327,6 +327,9 @@ int main(int argc, char** argv) {
     Opts o;
     try { o = parse(argc, argv); } catch (const std::exception& e) { std::cerr << e.what() << "\n"; usage(); return 1; }
     std::signal(SIGINT, [](int) { g_stop = true; }); std::signal(SIGTERM, [](int) { g_stop = true; });
+#if !defined(_WIN32)
+    std::signal(SIGPIPE, SIG_IGN);   // a write to a closed TLS socket must reconnect, not kill the miner
+#endif
     auto gpus = listGpus();
     if (gpus.empty()) { std::cerr << "no CUDA devices\n"; return 1; }
     std::vector<int> devs = o.devices; if (devs.empty()) for (auto& g : gpus) devs.push_back(g.index);

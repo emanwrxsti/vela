@@ -9,6 +9,10 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #endif
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <poll.h>
+#endif
 
 using json = nlohmann::json;
 namespace meow {
@@ -31,7 +35,7 @@ StratumClient::StratumClient(std::string host, int port, bool tls, std::string w
     : host_(std::move(host)), port_(port), tls_(tls), wallet_(std::move(wallet)), password_(std::move(password)), ua_(std::move(ua)) {}
 StratumClient::~StratumClient() { stop(); }
 void StratumClient::start() { run_ = true; th_ = std::thread([this] { loop(); }); }
-void StratumClient::stop() { run_ = false; if (fd_ >= 0) net_shutdown(fd_); if (th_.joinable()) th_.join(); disconnect(); }
+void StratumClient::stop() { run_ = false; { std::lock_guard<std::mutex> l(wmu_); if (fd_ >= 0) net_shutdown(fd_); } if (th_.joinable()) th_.join(); disconnect(); }
 bool StratumClient::currentJob(Job& out) const { std::lock_guard<std::mutex> l(mu_); if (job_.id.empty()) return false; out = job_; return true; }
 
 bool StratumClient::connect() {
@@ -57,52 +61,102 @@ bool StratumClient::connect() {
         SSL_CTX* ctx = SSL_CTX_new(TLS_client_method()); SSL* ssl = SSL_new(ctx);
         SSL_set_tlsext_host_name(ssl, host_.c_str()); SSL_set_fd(ssl, fd);
         if (SSL_connect(ssl) != 1) { log("stratum: TLS handshake failed"); SSL_free(ssl); SSL_CTX_free(ctx); net_close((intptr_t)fd); fd_ = -1; return false; }
+#if !defined(_WIN32)
+        { int fl = fcntl(fd, F_GETFL, 0); if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK); }
+#endif
+        std::lock_guard<std::mutex> l(wmu_);
         ssl_ = ssl; sslCtx_ = ctx;
 #else
         log("stratum: built without OpenSSL, --tls unavailable"); net_close((intptr_t)fd); fd_ = -1; return false;
 #endif
     }
     rbuf_.clear();
+    lastRx_ = lastPing_ = std::chrono::steady_clock::now();
     return true;
 }
 void StratumClient::disconnect() {
+    std::lock_guard<std::mutex> l(wmu_);          // never free the SSL*/close the fd under a concurrent submit
+    stats.connected = false;
 #ifdef MEOW_HAVE_OPENSSL
     if (ssl_) { SSL_shutdown((SSL*)ssl_); SSL_free((SSL*)ssl_); ssl_ = nullptr; }
     if (sslCtx_) { SSL_CTX_free((SSL_CTX*)sslCtx_); sslCtx_ = nullptr; }
 #endif
     if (fd_ >= 0) { net_close(fd_); fd_ = -1; }
-    stats.connected = false;
 }
 bool StratumClient::sendLine(const std::string& s) {
     std::lock_guard<std::mutex> l(wmu_);
+    return sendLineLocked(s);
+}
+bool StratumClient::sendLineLocked(const std::string& s) {
     if (fd_ < 0) return false;
     std::string line = s + "\n"; size_t off = 0;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
     while (off < line.size()) {
         long long n;
 #ifdef MEOW_HAVE_OPENSSL
-        if (ssl_) n = SSL_write((SSL*)ssl_, line.data() + off, int(line.size() - off)); else
+        if (ssl_) {
+            n = SSL_write((SSL*)ssl_, line.data() + off, int(line.size() - off));
+            if (n <= 0) {
+                int e = SSL_get_error((SSL*)ssl_, int(n));
+#if !defined(_WIN32)
+                if ((e == SSL_ERROR_WANT_WRITE || e == SSL_ERROR_WANT_READ) && std::chrono::steady_clock::now() < deadline) {
+                    pollfd p{int(fd_), short(e == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN), 0}; poll(&p, 1, 200); continue;   // same buffer, as OpenSSL requires
+                }
 #endif
-        n = net_send(fd_, line.data() + off, line.size() - off);
-        if (n <= 0) return false;
+                net_shutdown(fd_);                    // wake the reader -> immediate reconnect
+                return false;
+            }
+        } else
+#endif
+        {
+            n = net_send(fd_, line.data() + off, line.size() - off);
+            if (n <= 0) { net_shutdown(fd_); return false; }
+        }
         off += size_t(n);
     }
+    (void)deadline;
     return true;
+}
+// One read attempt. TLS: non-blocking SSL_read under wmu_ (never concurrent with SSL_write);
+// waits for data with poll() *outside* the lock. Plain TCP: blocking recv with SO_RCVTIMEO.
+long long StratumClient::ioRead(char* buf, size_t n, bool& wouldBlock) {
+    wouldBlock = false;
+#ifdef MEOW_HAVE_OPENSSL
+    if (ssl_) {
+        long long r; int e;
+        { std::lock_guard<std::mutex> l(wmu_); if (!ssl_) return 0; r = SSL_read((SSL*)ssl_, buf, int(n)); e = r > 0 ? SSL_ERROR_NONE : SSL_get_error((SSL*)ssl_, int(r)); }
+        if (r > 0) return r;
+        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+#if !defined(_WIN32)
+            pollfd p{int(fd_), short(e == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN), 0}; poll(&p, 1, 1000);
+#endif
+            wouldBlock = true; return -1;
+        }
+        return 0;
+    }
+#endif
+    long long r = net_recv(fd_, buf, n);
+    if (r < 0 && net_would_block()) wouldBlock = true;
+    return r;
 }
 bool StratumClient::readLine(std::string& out) {
     for (;;) {
         size_t nl = rbuf_.find('\n');
         if (nl != std::string::npos) { out = rbuf_.substr(0, nl); rbuf_.erase(0, nl + 1); return true; }
         if (rbuf_.size() > (2u << 20)) return false;
-        char buf[65536]; long long n;
-#ifdef MEOW_HAVE_OPENSSL
-        if (ssl_) n = SSL_read((SSL*)ssl_, buf, sizeof(buf)); else
-#endif
-        n = net_recv(fd_, buf, sizeof(buf));
-        if (n <= 0) {
-            if (n < 0 && net_would_block()) { if (!run_) return false; continue; }   // timeout: keep waiting
-            return false;
+        char buf[65536]; bool wb = false;
+        long long n = ioRead(buf, sizeof(buf), wb);
+        if (n > 0) { rbuf_.append(buf, size_t(n)); lastRx_ = std::chrono::steady_clock::now(); continue; }
+        if (!wb || !run_) return false;               // EOF / error / stopping
+        // Liveness: blocks can be 30+ min apart, so silence alone is normal. Ping after 2 min of
+        // silence (pool answers "pong"); give up and reconnect after 5 min with nothing at all.
+        auto now = std::chrono::steady_clock::now();
+        if (now - lastRx_ > std::chrono::minutes(5)) { log("stratum: no data from pool for 5 min, reconnecting"); return false; }
+        if (now - lastRx_ > std::chrono::minutes(2) && now - lastPing_ > std::chrono::minutes(2)) {
+            lastPing_ = now; int id = nextId_++;
+            { std::lock_guard<std::mutex> l(mu_); pending_[id] = "mining.ping"; }
+            if (!sendLine(json{{"id", id}, {"method", "mining.ping"}, {"params", json::object()}}.dump())) return false;
         }
-        rbuf_.append(buf, size_t(n));
     }
 }
 void StratumClient::loop() {
@@ -111,7 +165,7 @@ void StratumClient::loop() {
         if (!connect()) { for (int i = 0; i < backoff * 10 && run_; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100)); backoff = std::min(backoff * 2, 60); continue; }
         backoff = 2; stats.connected = true; stats.reconnects++;
         log("stratum: connected to " + host_ + ":" + std::to_string(port_) + (tls_ ? " (TLS)" : ""));
-        { std::lock_guard<std::mutex> l(mu_); pending_.clear(); job_ = Job(); haveDiff_ = false; }
+        { std::lock_guard<std::mutex> l(mu_); pending_.clear(); job_ = Job(); haveDiff_ = false; extranonce1_.clear(); connJobs_.clear(); }
         json sub = {{"id", 1}, {"method", "mining.subscribe"}, {"params", {{"user_agent", ua_}}}};
         json auth = {{"id", 2}, {"method", "mining.authorize"}, {"params", {{"wallet", wallet_}, {"password", password_}}}};
         if (!sendLine(sub.dump()) || !sendLine(auth.dump())) { disconnect(); continue; }
@@ -149,7 +203,7 @@ void StratumClient::handle(const std::string& line) {
             {
                 std::lock_guard<std::mutex> l(mu_);
                 j.difficulty = haveDiff_ ? difficulty_ : 2048; j.target = targetFromDifficulty(j.difficulty);
-                j.generation = ++gen_; job_ = j;
+                j.generation = ++gen_; job_ = j; connJobs_.insert(j.id);
                 if (!j.modelHash.empty()) modelHash_ = j.modelHash;
             }
             log("stratum: job " + j.id + " height " + std::to_string(j.height) + (j.clean ? " (clean)" : "") + " diff " + std::to_string((long long)j.difficulty) + " tokens " + std::to_string(j.promptTokens.size()));
@@ -185,22 +239,37 @@ void StratumClient::handle(const std::string& line) {
     if (method == "mining.submit") {
         if (ok) { stats.accepted++; log("share accepted (" + std::to_string(stats.accepted.load()) + "/" + std::to_string(stats.submitted.load()) + ")"); }
         else { if (err.find("code 21") != std::string::npos) stats.stale++; else stats.rejected++; log("share REJECTED: " + err); }
+    } else if (method == "mining.ping") {
+        // keepalive answer; lastRx_ was already refreshed by readLine
     } else if (method == "mining.suggest_difficulty") {
         log(ok ? "stratum: suggest_difficulty accepted" : "stratum: suggest_difficulty: " + err);
     }
 }
 void StratumClient::submit(const std::string& jobId, const std::string& en2, const std::string& ntime, const std::string& nonce, const std::string& x0Hex, const std::string& hpoi) {
+    // A share is only valid on the connection whose job (and extranonce1) produced it. Shares found
+    // while reconnecting, or for a job from the previous connection, are discarded instead of being
+    // sent (they would be rejected and can count towards the pool's invalid-share ban).
     int id = nextId_++;
+    {
+        std::lock_guard<std::mutex> l(mu_);
+        if (!stats.connected || !connJobs_.count(jobId)) {
+            stats.discarded++;
+            log(std::string("stratum: share discarded (") + (stats.connected ? "job " + jobId + " is from a previous connection" : std::string("not connected, reconnecting")) + ")");
+            return;
+        }
+        pending_[id] = "mining.submit";
+    }
     json r = {{"id", id}, {"method", "mining.submit"}, {"params", {{"worker", wallet_}, {"job_id", jobId}, {"extranonce2", en2}, {"ntime", ntime}, {"nonce", nonce}, {"x0_hex", x0Hex}, {"hashpoi_hex", hpoi}}}};
-    { std::lock_guard<std::mutex> l(mu_); pending_[id] = "mining.submit"; }
-    stats.submitted++;
-    if (!sendLine(r.dump())) log("stratum: submit failed (not connected)");
+    if (sendLine(r.dump())) { stats.submitted++; return; }
+    { std::lock_guard<std::mutex> l(mu_); pending_.erase(id); }
+    stats.discarded++;
+    log("stratum: share discarded (connection lost while sending, reconnecting)");
 }
 void StratumClient::suggestDifficulty(double d) {
     int id = nextId_++;
     json r = {{"id", id}, {"method", "mining.suggest_difficulty"}, {"params", {{"difficulty", d}}}};
     { std::lock_guard<std::mutex> l(mu_); pending_[id] = "mining.suggest_difficulty"; }
     suggestDiff_ = r.dump();
-    if (fd_ >= 0) sendLine(suggestDiff_);
+    sendLine(suggestDiff_);
 }
 }  // namespace meow

@@ -29,8 +29,8 @@ components and models keep their own licenses.
 ## Download
 [GitHub Releases](https://github.com/ocminer/supr-meow-vela/releases) (and mirrored at https://vela.suprnova.cc/dl/):
 
-* `supr-meow-vela-0.1.4.tar.gz` — Linux x86-64 + bundled CUDA 13.3 runtime. One tarball serves **HiveOS** (`h-run.sh`), **MMPOS** (`mmpos-run.sh`) and **SMOS** (`smos-run.sh`) — pick the launcher for your OS; set `POOL_URL` and `WALLET` in the flight sheet. The model downloads automatically if it is not cached.
-* `supr-meow-vela-0.1.4-windows-x86_64.zip` — native **Windows** x64 build (no WSL/Docker). Edit `start.cmd` with your wallet and run it; the model downloads on first start. No TLS on Windows — use the plain-TCP port.
+* `supr-meow-vela-0.1.5.tar.gz` — Linux x86-64 + bundled CUDA 13.3 runtime. One tarball serves **HiveOS** (`h-run.sh`), **MMPOS** (`mmpos-run.sh`) and **SMOS** (`smos-run.sh`) — pick the launcher for your OS; set `POOL_URL` and `WALLET` in the flight sheet. The model downloads automatically if it is not cached.
+* `supr-meow-vela-0.1.5-windows-x86_64.zip` — native **Windows** x64 build (no WSL/Docker). Edit `start.cmd` with your wallet and run it; the model downloads on first start. No TLS on Windows — use the plain-TCP port.
 * `sd-turbo-int.poisd` — the model (~1.2 GB), plus `SHA256SUMS`.
 
 The model's primary URL is `https://vela.suprnova.cc/dl/sd-turbo-int.poisd`;
@@ -54,7 +54,7 @@ expected checksum for an explicitly selected model.
 ./supr-meow-vela --bench 20 --batch 8     # throughput
 ./supr-meow-vela --verify-server --port 9010 --mem 1024 --batch 1   # pool verifier (HTTP POST /verify, GET /health)
 ```
-Measured (batch 8 × 2 lanes): RTX 5090 / RTX PRO 6000 ≈ 125–135 inf/s (575–600 W); RTX 6000 Ada ≈ 51; H200 ≈ 92; B200 ≈ 113; CMP 170HX ≈ 31.
+Version 0.1.5 measured **138.60 inf/s on RTX 5090** (600 W cap) and **53.43 inf/s on RTX 4070 Ti SUPER** (285 W cap), both at batch 4 × 2 lanes: **+2.66%** and **+2.43%** over 0.1.4 with matched settings. A separate RTX 5090 profile using `--batch 2 --lanes 4 --mem 1400` reached **139.22 inf/s**. See [release notes](RELEASE-v0.1.5.md) for measurement conditions.
 
 ## Build
 CUDA 12.8+ (13.3 used for releases), CMake ≥ 3.24, gcc 13. `cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j`.

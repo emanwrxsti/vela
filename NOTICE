@@ -14,7 +14,8 @@ binary built from this repository.
 --------------------------------------------------------------------------------
 nlohmann/json — MIT
     vendor/nlohmann/json.hpp
-    Copyright (c) 2013-2022 Niels Lohmann
+    Copyright (c) 2013-2025 Niels Lohmann
+    Full license: licenses/nlohmann-json-LICENSE.txt
 
 --------------------------------------------------------------------------------
 The sd-turbo-int model mined against is licensed by its respective authors and

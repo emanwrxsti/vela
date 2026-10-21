@@ -30,6 +30,7 @@ COPY --from=build /usr/local/cuda/targets/x86_64-linux/lib/libcublas.so.13   /ap
 COPY --from=build /usr/local/cuda/targets/x86_64-linux/lib/libcublasLt.so.13 /app/lib/
 COPY docker/entrypoint.sh /app/entrypoint.sh
 COPY README.md LICENSE NOTICE /app/
+COPY licenses/ /app/licenses/
 RUN chmod +x /app/entrypoint.sh /app/supr-meow-vela
 ENV LD_LIBRARY_PATH=/app/lib
 RUN mkdir -p /models

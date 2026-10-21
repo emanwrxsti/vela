@@ -124,7 +124,8 @@ Engine::Engine(const DevModel& dm, const EngineConfig& cfg) : dm_(dm), cfg_(cfg)
     dIds_ = (int32_t*)palloc(96 * 4);
     CUDA_CHECK(cudaHostAlloc((void**)&hSeeds_, 32 * B, cudaHostAllocDefault));
     CUDA_CHECK(cudaHostAlloc((void**)&hOut_, 32768 * B, cudaHostAllocDefault));
-    CUDA_CHECK(cudaEventCreate(&ev0_)); CUDA_CHECK(cudaEventCreate(&ev1_));
+    CUDA_CHECK(cudaEventCreate(&ev0_));
+    CUDA_CHECK(cudaEventCreateWithFlags(&ev1_, cudaEventBlockingSync));
 }
 Engine::~Engine() {
     cudaStreamSynchronize(st_);
@@ -607,14 +608,16 @@ void Engine::forwardIO(uint8_t* hSeeds, uint8_t* dSeeds, uint8_t* dOut, uint8_t*
     CUDA_CHECK(cudaMemcpyAsync(hOut, dOut, 32768 * B, cudaMemcpyDeviceToHost, st_));
 }
 void Engine::ensureSlot(int slot) {
-    if (gexecS_[slot]) return;
+    if (evDone_[slot]) return;
     const int B = cfg_.batch;
     if (slot == 0) { dSeedsS_[0] = dSeeds_; dOutS_[0] = dOut_; hSeedsS_[0] = hSeeds_; hOutS_[0] = hOut_; }
     else {
         dSeedsS_[1] = (uint8_t*)palloc(32 * B); dOutS_[1] = (uint8_t*)palloc(32768 * B);
         CUDA_CHECK(cudaHostAlloc((void**)&hSeedsS_[1], 32 * B, cudaHostAllocDefault)); CUDA_CHECK(cudaHostAlloc((void**)&hOutS_[1], 32768 * B, cudaHostAllocDefault));
     }
-    CUDA_CHECK(cudaEventCreateWithFlags(&evDone_[slot], cudaEventDisableTiming));
+    // Two batches stay queued per lane. Sleep while the GPU owns this slot:
+    // spinning here consumes a CPU core per lane without adding GPU work.
+    CUDA_CHECK(cudaEventCreateWithFlags(&evDone_[slot], cudaEventDisableTiming | cudaEventBlockingSync));
     if (!cfg_.graph) return;
     // warm-up (plans/autotune) once, then capture a graph bound to this slot's buffers
     forwardIO(hSeedsS_[slot], dSeedsS_[slot], dOutS_[slot], hOutS_[slot]);

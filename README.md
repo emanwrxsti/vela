@@ -63,6 +63,10 @@ The Linux packages require glibc 2.38 or newer and OpenSSL 3. The Docker image
 includes a compatible userspace for hosts with an older distribution.
 
 Build with `-DMEOW_BUILD_TESTS=ON` and run `ctest --test-dir build --output-on-failure` for CPU tests.
+For GPU arithmetic checks, select an available card with `CUDA_VISIBLE_DEVICES`
+and run `./build/meow-im2col-test` and `./build/meow-normalization-test`.
+These compare output bytes, quantization scales and padding against independent
+integer references, including extreme inputs and partial rows.
 With two available GPUs and the model installed, run
 `python3 tests/multi_gpu.py --miner ./build/supr-meow-vela --model sd-turbo-int.poisd --devices 0,1`.
 This checks the consensus vector across devices in both orders, eager and graph execution, and concurrent mining lanes.

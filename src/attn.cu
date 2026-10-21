@@ -79,7 +79,7 @@ __device__ __forceinline__ int lutexp32(unsigned z, const int32_t* L) {
     return z < (16u << 16) ? v : 0;
 }
 
-template <int PASS>
+template <int PASS, bool Unmasked>
 __global__ void __launch_bounds__(NTHR, (TQ == 64 ? (PASS == 2 ? 2 : 3) : 1)) attn_pass_k(
     const int8_t* __restrict__ qhi, const int8_t* __restrict__ qlo, const int32_t* __restrict__ eq, const i64* __restrict__ qhs, const i64* __restrict__ qls,
     const int8_t* __restrict__ khi, const int8_t* __restrict__ klo, const int32_t* __restrict__ ek, const i64* __restrict__ ksum,
@@ -114,7 +114,7 @@ __global__ void __launch_bounds__(NTHR, (TQ == 64 ? (PASS == 2 ? 2 : 3) : 1)) at
     if (PASS >= 1) { mxr0 = gmx[rowBase + row0]; mxr1 = gmx[rowBase + row1]; }
     if (PASS == 2) { i64 rr0 = gr[rowBase + row0], rr1 = gr[rowBase + row1]; r0lo = unsigned(rr0); r0hi = unsigned(rr0 >> 32); r1lo = unsigned(rr1); r1hi = unsigned(rr1 >> 32); }
     // passes 0/1 may skip fully-masked tiles; pass 2 must include every key tile (the 128*vsum correction assumes all keys went through the MMA with P = 0 = (0,-128)).
-    const int nTiles = (PASS == 2 || !causal) ? Tkp / TK : min(Tkp / TK, (qt + 1) * (TQ / TK));
+    const int nTiles = (PASS == 2 || Unmasked || !causal) ? Tkp / TK : min(Tkp / TK, (qt + 1) * (TQ / TK));
     int mx0 = INT_MIN, mx1 = INT_MIN; i64 sum0 = 0, sum1 = 0;
     // At most 4096 keys: sums of signed byte planes fit comfortably in int32.
     int phs0 = 0, phs1 = 0, pls0 = 0, pls1 = 0;
@@ -138,9 +138,15 @@ __global__ void __launch_bounds__(NTHR, (TQ == 64 ? (PASS == 2 ? 2 : 3) : 1)) at
         if (PASS == 2) { loadV(kt); cp_commit(); }               // V(kt): waited for right before the PV stage
         if (kt + 1 < nTiles) { loadK(buf ^ 1, kt + 1); cp_commit(); }
         const int8_t* Kh = S.khi[buf]; const int8_t* Kl = S.klo[buf]; const i64* Ks = S.ksum[buf]; const int32_t* Ke = S.ek[buf];
-        const bool fullTile = (k0 + TK <= Tk) && !causal;       // no per-element validity checks needed
+        const bool fullTile = Unmasked || ((k0 + TK <= Tk) && !causal);       // no per-element validity checks needed
         // scores: this warp -> n-tiles kh*4 .. kh*4+3 (8 keys each), two n-tiles per scalar block for ILP
-        constexpr int NU = 2;                                    // n-tiles per scalar block (4 spills at 80 regs and is slower)
+        // On consumer Blackwell, the unmasked PV path needs a smaller live
+        // score tile to reduce register spills. Ada retains the paired tile.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+        constexpr int NU = (PASS == 2 && Unmasked) ? 1 : 2;
+#else
+        constexpr int NU = 2;
+#endif
         for (int np = 0; np < 4 / NU; ++np) {
             int32_t hh[NU][4], hl[NU][4], ll[NU][4];
             #pragma unroll
@@ -257,17 +263,32 @@ void k_fused_attention(cudaStream_t st, const int8_t* qhi, const int8_t* qlo, co
     // Each lane has its own cache, avoiding a host data race; reconfigure when
     // the same thread switches devices (e.g. checking several GPUs in order).
     static thread_local int attrDevice = -1;
+    static thread_local bool specializeUnmasked = false;
     int device = -1;
     CUDA_CHECK(cudaGetDevice(&device));
     if (attrDevice != device) {
-        CUDA_CHECK(cudaFuncSetAttribute(attn_pass_k<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(SMEM0)));
-        CUDA_CHECK(cudaFuncSetAttribute(attn_pass_k<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(SMEM1)));
-        CUDA_CHECK(cudaFuncSetAttribute(attn_pass_k<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(SMEM2)));
+        cudaDeviceProp prop{};
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+        specializeUnmasked = (prop.major == 8 && prop.minor == 9) || prop.major == 12;
+        CUDA_CHECK(cudaFuncSetAttribute(attn_pass_k<0, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(SMEM0)));
+        CUDA_CHECK(cudaFuncSetAttribute(attn_pass_k<0, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(SMEM0)));
+        CUDA_CHECK(cudaFuncSetAttribute(attn_pass_k<1, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(SMEM1)));
+        CUDA_CHECK(cudaFuncSetAttribute(attn_pass_k<1, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(SMEM1)));
+        CUDA_CHECK(cudaFuncSetAttribute(attn_pass_k<2, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(SMEM2)));
+        CUDA_CHECK(cudaFuncSetAttribute(attn_pass_k<2, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(SMEM2)));
         attrDevice = device;
     }
     dim3 grid(Tqp / TQ, B * heads);
-    attn_pass_k<0><<<grid, NTHR, SMEM0, st>>>(qhi, qlo, eq, qhs, qls, khi, klo, ek, ksum, vthi, vtlo, ev, vsum, Tq, Tqp, Tk, Tkp, causal, Lexp, heads, C, gmx, gr, out, rowmax);
-    attn_pass_k<1><<<grid, NTHR, SMEM1, st>>>(qhi, qlo, eq, qhs, qls, khi, klo, ek, ksum, vthi, vtlo, ev, vsum, Tq, Tqp, Tk, Tkp, causal, Lexp, heads, C, gmx, gr, out, rowmax);
-    attn_pass_k<2><<<grid, NTHR, SMEM2, st>>>(qhi, qlo, eq, qhs, qls, khi, klo, ek, ksum, vthi, vtlo, ev, vsum, Tq, Tqp, Tk, Tkp, causal, Lexp, heads, C, gmx, gr, out, rowmax);
+    // All model self-attention keys are real and noncausal. Compile out
+    // element masking only when the entire padded key domain is valid.
+    if (specializeUnmasked && !causal && Tk == Tkp) {
+        attn_pass_k<0, true><<<grid, NTHR, SMEM0, st>>>(qhi, qlo, eq, qhs, qls, khi, klo, ek, ksum, vthi, vtlo, ev, vsum, Tq, Tqp, Tk, Tkp, causal, Lexp, heads, C, gmx, gr, out, rowmax);
+        attn_pass_k<1, true><<<grid, NTHR, SMEM1, st>>>(qhi, qlo, eq, qhs, qls, khi, klo, ek, ksum, vthi, vtlo, ev, vsum, Tq, Tqp, Tk, Tkp, causal, Lexp, heads, C, gmx, gr, out, rowmax);
+        attn_pass_k<2, true><<<grid, NTHR, SMEM2, st>>>(qhi, qlo, eq, qhs, qls, khi, klo, ek, ksum, vthi, vtlo, ev, vsum, Tq, Tqp, Tk, Tkp, causal, Lexp, heads, C, gmx, gr, out, rowmax);
+    } else {
+        attn_pass_k<0, false><<<grid, NTHR, SMEM0, st>>>(qhi, qlo, eq, qhs, qls, khi, klo, ek, ksum, vthi, vtlo, ev, vsum, Tq, Tqp, Tk, Tkp, causal, Lexp, heads, C, gmx, gr, out, rowmax);
+        attn_pass_k<1, false><<<grid, NTHR, SMEM1, st>>>(qhi, qlo, eq, qhs, qls, khi, klo, ek, ksum, vthi, vtlo, ev, vsum, Tq, Tqp, Tk, Tkp, causal, Lexp, heads, C, gmx, gr, out, rowmax);
+        attn_pass_k<2, false><<<grid, NTHR, SMEM2, st>>>(qhi, qlo, eq, qhs, qls, khi, klo, ek, ksum, vthi, vtlo, ev, vsum, Tq, Tqp, Tk, Tkp, causal, Lexp, heads, C, gmx, gr, out, rowmax);
+    }
 }
 }  // namespace meow

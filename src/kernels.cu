@@ -132,28 +132,37 @@ __global__ void im2col3_k(const int32_t* __restrict__ X, const u32* __restrict__
     __syncthreads();
     int ee = she; int K = 9 * C;
     int8_t* h = hi + size_t(r) * Kp; int8_t* l = lo + size_t(r) * Kp;
-    for (int tap = 0; tap < 9; ++tap) {
+    if ((C & 15) == 0) {
+        // Distribute all nine patches across the block. A single patch has
+        // only 20/40/80 vectors at the common channel sizes, leaving most
+        // of a 256-thread block idle when patches are processed serially.
+        const int vectors = C >> 4;
+        for (int index = threadIdx.x; index < 9 * vectors; index += blockDim.x) {
+            const int tap = index / vectors, c0 = (index - tap * vectors) * 16;
+            const int ky = tap / 3, kx = tap - ky * 3, iy = iy0 + ky, ix = ix0 + kx;
+            const bool in = iy >= 0 && iy < H && ix >= 0 && ix < W;
+            const int32_t* xp = in ? X + ((size_t(b) * H + iy) * W + ix) * C : nullptr;
+            u32 hv[4], lv[4];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                int4 xv = in ? *reinterpret_cast<const int4*>(xp + c0 + j * 4) : make_int4(0, 0, 0, 0);
+                int q0 = in ? quant16_32(xv.x, ee) : 0, q1 = in ? quant16_32(xv.y, ee) : 0, q2 = in ? quant16_32(xv.z, ee) : 0, q3 = in ? quant16_32(xv.w, ee) : 0;
+                hv[j] = u32(uint8_t(q0 >> 8)) | (u32(uint8_t(q1 >> 8)) << 8) | (u32(uint8_t(q2 >> 8)) << 16) | (u32(uint8_t(q3 >> 8)) << 24);
+                lv[j] = u32(uint8_t((q0 & 255) - 128)) | (u32(uint8_t((q1 & 255) - 128)) << 8) | (u32(uint8_t((q2 & 255) - 128)) << 16) | (u32(uint8_t((q3 & 255) - 128)) << 24);
+            }
+            *reinterpret_cast<uint4*>(h + tap * C + c0) = make_uint4(hv[0], hv[1], hv[2], hv[3]);
+            *reinterpret_cast<uint4*>(l + tap * C + c0) = make_uint4(lv[0], lv[1], lv[2], lv[3]);
+        }
+    } else for (int tap = 0; tap < 9; ++tap) {
         int ky = tap / 3, kx = tap - ky * 3, iy = iy0 + ky, ix = ix0 + kx;
         bool in = iy >= 0 && iy < H && ix >= 0 && ix < W;
         const int32_t* xp = in ? X + ((size_t(b) * H + iy) * W + ix) * C : nullptr;
         int8_t* ht = h + tap * C; int8_t* lt = l + tap * C;
-        if ((C & 15) == 0) {
-            for (int c16 = threadIdx.x; c16 < (C >> 4); c16 += blockDim.x) {
-                const int c0 = c16 * 16; u32 hv[4], lv[4];
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    int4 xv = in ? *reinterpret_cast<const int4*>(xp + c0 + j * 4) : make_int4(0, 0, 0, 0);
-                    int q0 = in ? quant16_32(xv.x, ee) : 0, q1 = in ? quant16_32(xv.y, ee) : 0, q2 = in ? quant16_32(xv.z, ee) : 0, q3 = in ? quant16_32(xv.w, ee) : 0;
-                    hv[j] = (u32(uint8_t(q0 >> 8))) | (u32(uint8_t(q1 >> 8)) << 8) | (u32(uint8_t(q2 >> 8)) << 16) | (u32(uint8_t(q3 >> 8)) << 24);
-                    lv[j] = (u32(uint8_t((q0 & 255) - 128))) | (u32(uint8_t((q1 & 255) - 128)) << 8) | (u32(uint8_t((q2 & 255) - 128)) << 16) | (u32(uint8_t((q3 & 255) - 128)) << 24);
-                }
-                *reinterpret_cast<uint4*>(ht + c0) = make_uint4(hv[0], hv[1], hv[2], hv[3]); *reinterpret_cast<uint4*>(lt + c0) = make_uint4(lv[0], lv[1], lv[2], lv[3]);
-            }
-        } else for (int c4 = threadIdx.x; c4 < (C >> 2); c4 += blockDim.x) {
+        for (int c4 = threadIdx.x; c4 < (C >> 2); c4 += blockDim.x) {
             int4 xv = in ? *reinterpret_cast<const int4*>(xp + c4 * 4) : make_int4(0, 0, 0, 0);
             int q0 = in ? quant16_32(xv.x, ee) : 0, q1 = in ? quant16_32(xv.y, ee) : 0, q2 = in ? quant16_32(xv.z, ee) : 0, q3 = in ? quant16_32(xv.w, ee) : 0;
-            u32 hv = (u32(uint8_t(q0 >> 8))) | (u32(uint8_t(q1 >> 8)) << 8) | (u32(uint8_t(q2 >> 8)) << 16) | (u32(uint8_t(q3 >> 8)) << 24);
-            u32 lv = (u32(uint8_t((q0 & 255) - 128))) | (u32(uint8_t((q1 & 255) - 128)) << 8) | (u32(uint8_t((q2 & 255) - 128)) << 16) | (u32(uint8_t((q3 & 255) - 128)) << 24);
+            u32 hv = u32(uint8_t(q0 >> 8)) | (u32(uint8_t(q1 >> 8)) << 8) | (u32(uint8_t(q2 >> 8)) << 16) | (u32(uint8_t(q3 >> 8)) << 24);
+            u32 lv = u32(uint8_t((q0 & 255) - 128)) | (u32(uint8_t((q1 & 255) - 128)) << 8) | (u32(uint8_t((q2 & 255) - 128)) << 16) | (u32(uint8_t((q3 & 255) - 128)) << 24);
             *reinterpret_cast<u32*>(ht + c4 * 4) = hv; *reinterpret_cast<u32*>(lt + c4 * 4) = lv;
         }
     }
@@ -320,8 +329,63 @@ template <int R4> __device__ __forceinline__ void quant_row_out_w4(const int* v,
     }
     for (int c = C + lane; c < Kp; c += 32) { h[c] = 0; l[c] = -128; }
 }
+// Fixed indices keep normalization rows in registers.
+template <int R4> __device__ __forceinline__ void quant_row_out_w4_regs(const int* v, int cnt, int8_t* h, int8_t* l, int32_t* e, int C, int Kp) {
+    const int lane = threadIdx.x & 31;
+    u32 m = 0;
+    #pragma unroll
+    for (int j = 0; j < 4 * R4; ++j) if (j < 4 * cnt) m = max(m, iabs32(v[j]));
+    m = warp_umax(m);
+    const int ee = row_exp(m);
+    if (lane == 0) *e = ee;
+    #pragma unroll
+    for (int j = 0; j < R4; ++j) if (j < cnt) {
+        const int c = (lane + 32 * j) * 4;
+        int q0 = quant16_32(v[4 * j], ee), q1 = quant16_32(v[4 * j + 1], ee), q2 = quant16_32(v[4 * j + 2], ee), q3 = quant16_32(v[4 * j + 3], ee);
+        *reinterpret_cast<u32*>(h + c) = u32(uint8_t(q0 >> 8)) | (u32(uint8_t(q1 >> 8)) << 8) | (u32(uint8_t(q2 >> 8)) << 16) | (u32(uint8_t(q3 >> 8)) << 24);
+        *reinterpret_cast<u32*>(l + c) = u32(uint8_t((q0 & 255) - 128)) | (u32(uint8_t((q1 & 255) - 128)) << 8) | (u32(uint8_t((q2 & 255) - 128)) << 16) | (u32(uint8_t((q3 & 255) - 128)) << 24);
+    }
+    for (int c = C + lane; c < Kp; c += 32) { h[c] = 0; l[c] = -128; }
+}
 template <int R4>
 __global__ void lnorm_qw_k(const int32_t* __restrict__ X, int M, int C, const int32_t* __restrict__ g, const int32_t* __restrict__ beta, i64 den, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, int Kp) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 890 || __CUDA_ARCH__ >= 1200)
+
+    const int lane = threadIdx.x & 31; const size_t row = size_t(blockIdx.x) * 8 + (threadIdx.x >> 5);
+    if (row >= size_t(M)) return;
+    const int32_t* x = X + row * C; const int C4 = C >> 2;
+    int v[4 * R4]; int cnt = 0;
+    i64 sum = 0; int mn = INT_MAX, mx = INT_MIN;
+    #pragma unroll
+    for (int j = 0; j < R4; ++j) if (lane + 32 * j < C4) {
+        const int c4 = lane + 32 * j; ++cnt;
+        int4 t = *reinterpret_cast<const int4*>(x + c4 * 4);
+        v[4 * j] = t.x; v[4 * j + 1] = t.y; v[4 * j + 2] = t.z; v[4 * j + 3] = t.w;
+        sum += i64(t.x) + t.y + t.z + t.w; mn = min(mn, min(min(t.x, t.y), min(t.z, t.w))); mx = max(mx, max(max(t.x, t.y), max(t.z, t.w)));
+    }
+    sum = warp_sum(sum); mn = warp_min(mn); mx = warp_max(mx);
+    const i64 n = C, mean = floor_div(sum + n / 2, n);
+    const int ex = max(0, row_exp(max(mx - mean, mean - mn)) - 5);
+    i64 ss = 0;
+    #pragma unroll
+    for (int j = 0; j < 4 * R4; ++j) if (j < 4 * cnt) { i64 dd = rshr(i64(v[j]) - mean, ex); ss += dd * dd; }
+    ss = warp_sum(ss);
+    const i64 var = floor_div(ss, n);
+    const int shb = 32 - 2 * ex; const i64 one = shb >= 0 ? (1LL << shb) : 0;
+    const i64 eps = floor_div(one + den / 2, den);
+    const i64 sd = isqrt_i64((var + eps) << 16), sd2 = 2 * sd; const i64 sc = 1LL << (24 - ex); const double inv = 1.0 / double(sd2);
+    #pragma unroll
+    for (int j = 0; j < R4; ++j) if (j < cnt) {
+        const int c = (lane + 32 * j) * 4;
+        const int4 gg = *reinterpret_cast<const int4*>(g + c), bb = *reinterpret_cast<const int4*>(beta + c);
+        const int gv[4] = {gg.x, gg.y, gg.z, gg.w}, bv[4] = {bb.x, bb.y, bb.z, bb.w};
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) { i64 d = i64(v[4 * j + k]) - mean; i64 yy = floor_div_r(d * sc * 2 + sd, sd2, inv); v[4 * j + k] = int(sat32(rshr(yy * gv[k], 16) + bv[k])); }
+    }
+    quant_row_out_w4_regs<R4>(v, cnt, hi + row * Kp, lo + row * Kp, e + row, C, Kp);
+
+#else
+
     const int lane = threadIdx.x & 31; const size_t row = size_t(blockIdx.x) * 8 + (threadIdx.x >> 5);
     if (row >= size_t(M)) return;
     const int32_t* x = X + row * C; const int C4 = C >> 2;
@@ -350,10 +414,47 @@ __global__ void lnorm_qw_k(const int32_t* __restrict__ X, int M, int C, const in
         for (int k = 0; k < 4; ++k) { i64 d = i64(v[4 * j + k]) - mean; i64 yy = floor_div_r(d * sc * 2 + sd, sd2, inv); v[4 * j + k] = int(sat32(rshr(yy * gv[k], 16) + bv[k])); }
     }
     quant_row_out_w4<R4>(v, cnt, hi + row * Kp, lo + row * Kp, e + row, C, Kp);
+
+#endif
 }
 template <int R4>
 __global__ void gn_apply_roww_k(const int32_t* __restrict__ X, size_t M, int T, int C, int groups, const GnStat* __restrict__ gs, const int32_t* __restrict__ g, const int32_t* __restrict__ beta, const int32_t* __restrict__ Lsig,
                                 int32_t* __restrict__ Y, u32* __restrict__ pm, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, int Kp) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
+
+    __shared__ GnStat sgs[8][32]; __shared__ double sinv[8][32];
+    const int lane = threadIdx.x & 31; const int wrow = threadIdx.x >> 5; const size_t row = size_t(blockIdx.x) * 8 + wrow;
+    const int b = int(row / T); const int cg = C / groups; const float icg = 1.0f / float(cg);
+    if (row < M) { sgs[wrow][lane] = gs[b * groups + lane]; sinv[wrow][lane] = 1.0 / double(2 * sgs[wrow][lane].sd); }
+    __syncwarp();
+    if (row >= M) return;
+    const int32_t* x = X + row * C; const int C4 = C >> 2;
+    int v[4 * R4]; int cnt = 0; u32 m = 0;
+    #pragma unroll
+    for (int j = 0; j < R4; ++j) if (lane + 32 * j < C4) {
+        const int c4 = lane + 32 * j; ++cnt;
+        const int c = c4 * 4;
+        const int4 t = *reinterpret_cast<const int4*>(x + c), gg = *reinterpret_cast<const int4*>(g + c), bb = *reinterpret_cast<const int4*>(beta + c);
+        const int xv[4] = {t.x, t.y, t.z, t.w}, gv[4] = {gg.x, gg.y, gg.z, gg.w}, bv[4] = {bb.x, bb.y, bb.z, bb.w};
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int gi = int((float(c + k) + 0.5f) * icg); const GnStat& st = sgs[wrow][gi];
+            i64 d = i64(xv[k]) - st.mean;
+            i64 yy = floor_div_r(d * (1LL << (24 - st.e)) * 2 + st.sd, 2 * st.sd, sinv[wrow][gi]);
+            i64 y = sat32(rshr(yy * gv[k], 16) + bv[k]);
+            if (Lsig) y = sat32(rshr(y * lut16i(y, Lsig), 16));
+            v[4 * j + k] = int(y); m = max(m, iabs32(int(y)));
+        }
+    }
+    if (hi) { quant_row_out_w4_regs<R4>(v, cnt, hi + row * Kp, lo + row * Kp, e + row, C, Kp); return; }
+    int32_t* y = Y + row * C;
+    #pragma unroll
+    for (int j = 0; j < R4; ++j) if (j < cnt) *reinterpret_cast<int4*>(y + (lane + 32 * j) * 4) = make_int4(v[4 * j], v[4 * j + 1], v[4 * j + 2], v[4 * j + 3]);
+    m = warp_umax(m);
+    if (lane == 0) pm[row] = m;
+
+#else
+
     __shared__ GnStat sgs[8][32]; __shared__ double sinv[8][32];
     const int lane = threadIdx.x & 31; const int wrow = threadIdx.x >> 5; const size_t row = size_t(blockIdx.x) * 8 + wrow;
     const int b = int(row / T); const int cg = C / groups; const float icg = 1.0f / float(cg);
@@ -381,6 +482,8 @@ __global__ void gn_apply_roww_k(const int32_t* __restrict__ X, size_t M, int T, 
     for (int j = 0; j < cnt; ++j) *reinterpret_cast<int4*>(y + (lane + 32 * j) * 4) = make_int4(v[4 * j], v[4 * j + 1], v[4 * j + 2], v[4 * j + 3]);
     m = warp_umax(m);
     if (lane == 0) pm[row] = m;
+
+#endif
 }
 template <int R4>
 __global__ void quant_rows_w_k(const int32_t* __restrict__ X, int M, int K, int ldx, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, int Kp) {

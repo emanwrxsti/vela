@@ -1,16 +1,78 @@
-MIT License
+Suprnova Vela Source-Available License 1.0
+Effective for versions carrying this license from 2026-10-21
 
-Copyright (c) 2026 ocminer / suprnova
+Copyright (c) 2026 ocminer / suprnova. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. Scope and definitions
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+"Software" means the original supr-meow-vela source code, mining and inference
+kernels, binaries, and accompanying materials supplied under this license.
+Separately licensed third-party components and models are excluded.
+
+A "Derivative Miner" is other mining or verification software that copies, adapts,
+incorporates, or links to any substantial portion of the Software, including
+its source, compiled kernels, or other compiled code. Running or compiling the
+unmodified Software as permitted in section 2(a) does not create a Derivative
+Miner and is not subject to the commercial-incorporation restriction.
+
+A "Commercial Miner" is a Derivative Miner sold, licensed for payment, offered
+as a paid software product or service, or monetized through a developer fee,
+mandatory donation, subscription, royalty, or paid feature. Merely earning
+mining rewards by operating the Software as permitted in section 2 is not
+commercial exploitation of the Software for this definition.
+
+A "Closed-Source Miner" is a Derivative Miner for which the complete preferred
+source for modification, including changes and the scripts needed to build
+it, is not publicly available without charge under this license. Independent
+third-party dependencies may retain their own licenses and source locations.
+
+2. Permissions
+
+Subject to the conditions below, you may:
+
+(a) download, inspect, compile, and run the unmodified Software for mining or
+    verification, including for profit and on hardware you own or manage;
+(b) modify the Software for private evaluation, research, and testing;
+(c) redistribute unmodified copies without a software license charge, retaining
+    this license, copyright notices, and third-party notices, and providing the
+    corresponding source or a working public link to that exact source; and
+(d) develop, use, and distribute a non-commercial Derivative Miner whose complete
+    corresponding source is publicly available under this same license. Mark
+    modifications clearly and retain the original copyright and notices.
+
+3. Commercial and closed-source incorporation prohibited
+
+Without prior written permission from ocminer / suprnova, you must not copy,
+adapt, incorporate, link, redistribute, or otherwise use the Software or any
+substantial portion of it to develop or operate a Commercial Miner or a
+Closed-Source Miner. Making source visible does not permit a Commercial Miner.
+Distributing a binary without charge does not permit a Closed-Source Miner.
+The private evaluation permission in section 2(b) does not permit deployment
+or distribution of a Commercial Miner or Closed-Source Miner.
+
+This restriction covers incorporation into another miner through source code,
+libraries, compiled kernels, or other compiled components. It does not claim
+ownership of independently implemented protocols, mathematical ideas, or
+separately licensed third-party material.
+
+4. Notices and additional permissions
+
+Do not remove or misrepresent the Software's authorship or licensing notices.
+No trademark license or endorsement is granted. Rights not expressly granted
+are reserved. Contact the repository owner at
+https://github.com/ocminer/supr-meow-vela for separate written permission.
+Unless that permission states otherwise, these conditions continue to apply.
+Permissions under this license terminate if you violate its conditions.
+
+5. Earlier releases and third-party terms
+
+This license applies to versions distributed with it. It does not revoke,
+replace, or narrow permissions already granted for earlier copies under the
+MIT license. Releases through v0.1.4 retain the license distributed with them.
+Third-party dependencies, bundled runtimes, and models retain their respective
+licenses; this license does not alter those terms.
+
+6. Disclaimer
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
@@ -19,3 +81,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+This is a source-available license, not the MIT license or an OSI-approved
+open-source license.

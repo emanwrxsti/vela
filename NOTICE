@@ -1,8 +1,15 @@
 supr-meow-vela
 Copyright (c) 2026 ocminer / suprnova
 
-The miner itself is MIT-licensed (see LICENSE). The third-party component below
-keeps its own terms, which travel with any binary built from this repository.
+Versions carrying the Suprnova Vela Source-Available License 1.0 are subject
+to LICENSE. Running the unmodified miner for mining or verification, including
+for profit, is permitted. Reuse in commercial or closed-source miners requires
+prior written permission from ocminer / suprnova. This change takes effect
+from 2026-10-21 for versions carrying it; releases through v0.1.4 retain their
+original MIT terms and are not retroactively relicensed.
+
+The third-party component below keeps its own terms, which travel with any
+binary built from this repository.
 
 --------------------------------------------------------------------------------
 nlohmann/json — MIT

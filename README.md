@@ -4,6 +4,23 @@ GPU miner for **Vela** (Proof-of-Inference v2, `sd-turbo-int` W8A16) and the poo
 Pure C++/CUDA: no Python, no torch. Bit-exact against `contrib/poi-sd/sdint.py` (the consensus reference) — every share
 is a real inference, verified by the pool with the same engine in `--verify-server` mode.
 
+## License
+
+The current source uses the [Suprnova Vela Source-Available License 1.0](LICENSE).
+You may run the unmodified miner and verifier, including to earn mining rewards.
+**Using this code, its kernels, or other substantial portions in a commercial
+or closed-source miner requires prior written permission from ocminer / suprnova.**
+Permitted derivative miners must be non-commercial and publish their complete
+corresponding source under the same license. See LICENSE for the full terms.
+
+This is source-available software, not MIT-licensed or OSI-approved open-source
+software. The change applies to versions carrying the new license from
+2026-10-21. Previously published releases through **v0.1.4 remain under their
+original MIT license**; their existing permissions are not revoked. Third-party
+components and models keep their own licenses.
+
+## Features
+
 * int8 tensor-core GEMMs through cuBLASLt (16-bit activations as a hi/lo int8 split with exact int64 reconstruction)
 * fused exact attention (`mma.sync` int8, 3-pass softmax, never materialises the score matrix)
 * exact integer GroupNorm / LayerNorm / LUT non-linearities, ChaCha20 noise on the GPU, CUDA Graphs, 2 lanes per GPU

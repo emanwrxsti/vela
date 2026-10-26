@@ -24,6 +24,16 @@ __device__ __forceinline__ i64 floor_div_r(i64 a, i64 b, double inv) {
     else if (r >= b) { ++q; r -= b; if (r >= b) { ++q; } }
     return q;
 }
+/** Exact floor(a / b) for 1 <= b < 2^62 and |a| < 2^62 without FP64: inv = ~0ull / b (per-divisor constant). q0 = floor(|a|*inv / 2^64) is
+ *  floor(|a|/b) or one less (inv >= 2^64/b - 2 and |a| < 2^63 give an error below 1), one correction step fixes it; negative a via -ceil(|a|/b). */
+__device__ __forceinline__ i64 floor_div_i(i64 a, i64 b, unsigned long long inv) {
+    const unsigned long long m = (unsigned long long)(a < 0 ? -a : a), ub = (unsigned long long)b;
+    unsigned long long q = __umul64hi(m, inv);
+    unsigned long long r = m - q * ub;
+    if (r >= ub) { ++q; r -= ub; }
+    if (a >= 0) return i64(q);
+    return r ? -i64(q) - 1 : -i64(q);
+}
 /** e = number of k in [15,32) with m >= 2^k  ==  max(0, bitlen(m) - 15) for m < 2^32. */
 __host__ __device__ __forceinline__ int row_exp(i64 m) { int e = 0; for (int k = 15; k < 32; ++k) e += (m >= (1LL << k)); return e; }
 __host__ __device__ __forceinline__ i64 quant16(i64 v, int e) { i64 q = rshr(v, e); return q < -32767 ? -32767 : (q > 32767 ? 32767 : q); }

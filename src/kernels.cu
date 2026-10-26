@@ -373,14 +373,14 @@ __global__ void lnorm_qw_k(const int32_t* __restrict__ X, int M, int C, const in
     const i64 var = floor_div(ss, n);
     const int shb = 32 - 2 * ex; const i64 one = shb >= 0 ? (1LL << shb) : 0;
     const i64 eps = floor_div(one + den / 2, den);
-    const i64 sd = isqrt_i64((var + eps) << 16), sd2 = 2 * sd; const i64 sc = 1LL << (24 - ex); const double inv = 1.0 / double(sd2);
+    const i64 sd = isqrt_i64((var + eps) << 16), sd2 = 2 * sd; const i64 sc = 1LL << (24 - ex); const unsigned long long inv = ~0ull / (unsigned long long)sd2;
     #pragma unroll
     for (int j = 0; j < R4; ++j) if (j < cnt) {
         const int c = (lane + 32 * j) * 4;
         const int4 gg = *reinterpret_cast<const int4*>(g + c), bb = *reinterpret_cast<const int4*>(beta + c);
         const int gv[4] = {gg.x, gg.y, gg.z, gg.w}, bv[4] = {bb.x, bb.y, bb.z, bb.w};
         #pragma unroll
-        for (int k = 0; k < 4; ++k) { i64 d = i64(v[4 * j + k]) - mean; i64 yy = floor_div_r(d * sc * 2 + sd, sd2, inv); v[4 * j + k] = int(sat32(rshr(yy * gv[k], 16) + bv[k])); }
+        for (int k = 0; k < 4; ++k) { i64 d = i64(v[4 * j + k]) - mean; i64 yy = floor_div_i(d * sc * 2 + sd, sd2, inv); v[4 * j + k] = int(sat32(rshr(yy * gv[k], 16) + bv[k])); }
     }
     quant_row_out_w4_regs<R4>(v, cnt, hi + row * Kp, lo + row * Kp, e + row, C, Kp);
 
@@ -405,13 +405,13 @@ __global__ void lnorm_qw_k(const int32_t* __restrict__ X, int M, int C, const in
     const i64 var = floor_div(ss, n);
     const int shb = 32 - 2 * ex; const i64 one = shb >= 0 ? (1LL << shb) : 0;
     const i64 eps = floor_div(one + den / 2, den);
-    const i64 sd = isqrt_i64((var + eps) << 16), sd2 = 2 * sd; const i64 sc = 1LL << (24 - ex); const double inv = 1.0 / double(sd2);
+    const i64 sd = isqrt_i64((var + eps) << 16), sd2 = 2 * sd; const i64 sc = 1LL << (24 - ex); const unsigned long long inv = ~0ull / (unsigned long long)sd2;
     for (int j = 0; j < cnt; ++j) {
         const int c = (lane + 32 * j) * 4;
         const int4 gg = *reinterpret_cast<const int4*>(g + c), bb = *reinterpret_cast<const int4*>(beta + c);
         const int gv[4] = {gg.x, gg.y, gg.z, gg.w}, bv[4] = {bb.x, bb.y, bb.z, bb.w};
         #pragma unroll
-        for (int k = 0; k < 4; ++k) { i64 d = i64(v[4 * j + k]) - mean; i64 yy = floor_div_r(d * sc * 2 + sd, sd2, inv); v[4 * j + k] = int(sat32(rshr(yy * gv[k], 16) + bv[k])); }
+        for (int k = 0; k < 4; ++k) { i64 d = i64(v[4 * j + k]) - mean; i64 yy = floor_div_i(d * sc * 2 + sd, sd2, inv); v[4 * j + k] = int(sat32(rshr(yy * gv[k], 16) + bv[k])); }
     }
     quant_row_out_w4<R4>(v, cnt, hi + row * Kp, lo + row * Kp, e + row, C, Kp);
 
@@ -422,10 +422,10 @@ __global__ void gn_apply_roww_k(const int32_t* __restrict__ X, size_t M, int T, 
                                 int32_t* __restrict__ Y, u32* __restrict__ pm, int8_t* __restrict__ hi, int8_t* __restrict__ lo, int32_t* __restrict__ e, int Kp) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
 
-    __shared__ GnStat sgs[8][32]; __shared__ double sinv[8][32];
+    __shared__ GnStat sgs[8][32]; __shared__ unsigned long long sinv[8][32];
     const int lane = threadIdx.x & 31; const int wrow = threadIdx.x >> 5; const size_t row = size_t(blockIdx.x) * 8 + wrow;
     const int b = int(row / T); const int cg = C / groups; const float icg = 1.0f / float(cg);
-    if (row < M) { sgs[wrow][lane] = gs[b * groups + lane]; sinv[wrow][lane] = 1.0 / double(2 * sgs[wrow][lane].sd); }
+    if (row < M) { sgs[wrow][lane] = gs[b * groups + lane]; sinv[wrow][lane] = ~0ull / (unsigned long long)(2 * sgs[wrow][lane].sd); }
     __syncwarp();
     if (row >= M) return;
     const int32_t* x = X + row * C; const int C4 = C >> 2;
@@ -440,7 +440,7 @@ __global__ void gn_apply_roww_k(const int32_t* __restrict__ X, size_t M, int T, 
         for (int k = 0; k < 4; ++k) {
             const int gi = int((float(c + k) + 0.5f) * icg); const GnStat& st = sgs[wrow][gi];
             i64 d = i64(xv[k]) - st.mean;
-            i64 yy = floor_div_r(d * (1LL << (24 - st.e)) * 2 + st.sd, 2 * st.sd, sinv[wrow][gi]);
+            i64 yy = floor_div_i(d * (1LL << (24 - st.e)) * 2 + st.sd, 2 * st.sd, sinv[wrow][gi]);
             i64 y = sat32(rshr(yy * gv[k], 16) + bv[k]);
             if (Lsig) y = sat32(rshr(y * lut16i(y, Lsig), 16));
             v[4 * j + k] = int(y); m = max(m, iabs32(int(y)));
@@ -455,10 +455,10 @@ __global__ void gn_apply_roww_k(const int32_t* __restrict__ X, size_t M, int T, 
 
 #else
 
-    __shared__ GnStat sgs[8][32]; __shared__ double sinv[8][32];
+    __shared__ GnStat sgs[8][32]; __shared__ unsigned long long sinv[8][32];
     const int lane = threadIdx.x & 31; const int wrow = threadIdx.x >> 5; const size_t row = size_t(blockIdx.x) * 8 + wrow;
     const int b = int(row / T); const int cg = C / groups; const float icg = 1.0f / float(cg);
-    if (row < M) { sgs[wrow][lane] = gs[b * groups + lane]; sinv[wrow][lane] = 1.0 / double(2 * sgs[wrow][lane].sd); }
+    if (row < M) { sgs[wrow][lane] = gs[b * groups + lane]; sinv[wrow][lane] = ~0ull / (unsigned long long)(2 * sgs[wrow][lane].sd); }
     __syncwarp();
     if (row >= M) return;
     const int32_t* x = X + row * C; const int C4 = C >> 2;
@@ -471,7 +471,7 @@ __global__ void gn_apply_roww_k(const int32_t* __restrict__ X, size_t M, int T, 
         for (int k = 0; k < 4; ++k) {
             const int gi = int((float(c + k) + 0.5f) * icg); const GnStat& st = sgs[wrow][gi];
             i64 d = i64(xv[k]) - st.mean;
-            i64 yy = floor_div_r(d * (1LL << (24 - st.e)) * 2 + st.sd, 2 * st.sd, sinv[wrow][gi]);
+            i64 yy = floor_div_i(d * (1LL << (24 - st.e)) * 2 + st.sd, 2 * st.sd, sinv[wrow][gi]);
             i64 y = sat32(rshr(yy * gv[k], 16) + bv[k]);
             if (Lsig) y = sat32(rshr(y * lut16i(y, Lsig), 16));
             v[4 * cnt + k] = int(y); m = max(m, iabs32(int(y)));

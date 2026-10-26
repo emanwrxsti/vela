@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <climits>
 #include <stdexcept>
+#include <type_traits>
 
 namespace meow {
 namespace {
@@ -12,7 +13,9 @@ constexpr int BK = 64, NTHR = 256;
 // Tile configuration: BM output rows per block (A tile = BM hi rows + BM lo rows), BN columns, WM x WN warps (8 total).
 template <int BM_, int BN_, int STAGES_, int WM_> struct Cfg {
     static constexpr int BM = BM_, BN = BN_, STAGES = STAGES_, WM = WM_, WN = 8 / WM_;
+    static constexpr int MINB = (BM_ == 64 && BN_ == 64) ? 2 : 1;      // resident blocks per SM the register budget must allow (64x64: 2 -> <= 128 regs)
     static constexpr int A_ROWS = 2 * BM, A_BYTES = A_ROWS * BK, B_BYTES = BN * BK, STAGE_BYTES = A_BYTES + B_BYTES, SMEM = STAGES * STAGE_BYTES;
+    static constexpr int CST_BYTES = BN * 16, SMEM_TOTAL = SMEM + CST_BYTES;   // per-column epilogue constants (int4 each) prefetched with stage 0
     static constexpr int WTM = BM / WM, WTN = BN / WN, MI = WTM / 16, NI = WTN / 8;     // per-warp output tile and mma tiles per plane
     static_assert(MI >= 1 && NI >= 2 && NI % 2 == 0 && 2 * MI * NI <= 16, "tile too large for registers");
     static constexpr int A_CHUNKS = A_ROWS * 4 / NTHR, B_CHUNKS = BN * 4 / NTHR;        // 16-byte chunks per thread per stage
@@ -38,6 +41,15 @@ __device__ __forceinline__ int epi1(int chi, int clo, const int4 c, int er) {
     i64 acc = 256LL * chi + clo + 128LL * c.w;
     return int(sat32(rshr(acc * c.x, c.y - er) + c.z));
 }
+/** epi1 for 1 <= c.y - er <= 62 (checked by the caller for all its elements): rshr(v, s) == sat32((v + 2^(s-1)) >> s) there, so this is
+ *  bit-identical to epi1 without the per-element shift-sign branch and shift clamp. */
+__device__ __forceinline__ int epi1f(int chi, int clo, const int4 c, int er) {
+    const i64 acc = 256LL * chi + clo + 128LL * c.w;
+    const i64 v = acc * i64(c.x);
+    const int s = c.y - er;
+    const i64 t = (v + (1LL << (s - 1))) >> s;
+    return int(sat32(sat32(t) + c.z));
+}
 
 __device__ __forceinline__ int rowexp_u32(uint32_t m) { return m ? max(0, 32 - __clz(m) - 15) : 0; }
 /** quantise 16 int32 values with shift e into packed hi/lo bytes (4 x u32 each) */
@@ -51,7 +63,7 @@ __device__ __forceinline__ void quant16x(const int32_t* v, int e, uint32_t* hi, 
 }
 
 template <int EPI, int SRC, class C>
-__global__ void __launch_bounds__(NTHR) gemm_hl_k(const ASrc A, int Mreal, const int8_t* __restrict__ W, int ldw, int Nreal, int Kp, const int4* __restrict__ cst, const AEpi E) {
+__global__ void __launch_bounds__(NTHR, C::MINB) gemm_hl_k(const ASrc A, int Mreal, const int8_t* __restrict__ W, int ldw, int Nreal, int Kp, const int4* __restrict__ cst, const AEpi E) {
     extern __shared__ __align__(128) unsigned char smem[];
     constexpr int BM = C::BM, BN = C::BN, STAGES = C::STAGES, MI = C::MI, NI = C::NI;
     static_assert(SRC == SRC_I8 || BM == 64, "register-path loaders assume 64 output rows per block (one 16-wide chunk per thread per stage)");
@@ -110,6 +122,9 @@ __global__ void __launch_bounds__(NTHR) gemm_hl_k(const ASrc A, int Mreal, const
     int32_t acc[2][MI][NI][4];
     #pragma unroll
     for (int p = 0; p < 2; ++p) for (int mi = 0; mi < MI; ++mi) for (int ni = 0; ni < NI; ++ni) for (int j = 0; j < 4; ++j) acc[p][mi][ni][j] = 0;
+    // epilogue constants of this block's BN columns -> smem, in flight under the main loop (committed with stage 0, so landed before compute(0))
+    int4* const scst = reinterpret_cast<int4*>(smem + C::SMEM);
+    for (int i = tid; i < BN; i += NTHR) { const int n = n0 + i; cp16z(scst + i, cst + (n < Nreal ? n : 0), n < Nreal); }
     int4 raw0[4], raw1[4];                            // two in-flight raw stages (static names: keep them in registers)
     if (SRC == SRC_I8) {
         #pragma unroll
@@ -174,7 +189,7 @@ __global__ void __launch_bounds__(NTHR) gemm_hl_k(const ASrc A, int Mreal, const
         int yv[4][4];
         #pragma unroll
         for (int ni = 0; ni < 4; ++ni) {
-            const int n = n0 + (wn * 4 + ni) * 8 + t4 * 2; const int4 c0 = cst[n], c1 = cst[n + 1];
+            const int n = n0 + (wn * 4 + ni) * 8 + t4 * 2; const int4 c0 = scst[n - n0], c1 = scst[n - n0 + 1];
             #pragma unroll
             for (int h = 0; h < 2; ++h) { const int er = h ? e1 : e0; yv[ni][2 * h] = epi1(acc[0][0][ni][2 * h], acc[1][0][ni][2 * h], c0, er); yv[ni][2 * h + 1] = epi1(acc[0][0][ni][2 * h + 1], acc[1][0][ni][2 * h + 1], c1, er); }
         }
@@ -224,23 +239,43 @@ __global__ void __launch_bounds__(NTHR) gemm_hl_k(const ASrc A, int Mreal, const
         }
         return;
     }
+    // Per-thread row exponents and column constants, loaded once; `fast` = every shift c.y - er of this thread's elements lies in [1, 62]
+    // (the practically-always case), which selects the branch-free exact epilogue epi1f. Elements outside Mreal/Nreal are skipped below as before.
+    int ev[MI][2]; bool fast = true;
     #pragma unroll
     for (int mi = 0; mi < MI; ++mi) {
         const int r0 = m0 + wm * C::WTM + mi * 16 + gid, r1 = r0 + 8;
-        int e0 = 0, e1 = 0;
-        if (SRC == SRC_X32) { e0 = r0 < Mreal ? rowexp_u32(A.rowmax[r0]) : 0; e1 = r1 < Mreal ? rowexp_u32(A.rowmax[r1]) : 0; }
-        else { e0 = r0 < Mreal ? e[r0] : 0; e1 = r1 < Mreal ? e[r1] : 0; }
+        if (SRC == SRC_X32) { ev[mi][0] = r0 < Mreal ? rowexp_u32(A.rowmax[r0]) : 0; ev[mi][1] = r1 < Mreal ? rowexp_u32(A.rowmax[r1]) : 0; }
+        else { ev[mi][0] = r0 < Mreal ? e[r0] : 0; ev[mi][1] = r1 < Mreal ? e[r1] : 0; }
+    }
+    #pragma unroll
+    for (int ni = 0; ni < NI; ++ni) {
+        const int n = n0 + (wn * NI + ni) * 8 + t4 * 2;
+        if (n >= Nreal) continue;
+        const int cy0 = scst[n - n0].y, cy1 = scst[n - n0 + 1].y;
+        #pragma unroll
+        for (int mi = 0; mi < MI; ++mi)
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) { const int s0 = cy0 - ev[mi][h], s1 = cy1 - ev[mi][h]; fast = fast && (s0 >= 1 && s0 <= 62 && s1 >= 1 && s1 <= 62); }
+    }
+    auto epilogue = [&](auto fastTag) {
+    constexpr bool FAST = decltype(fastTag)::value;
+    #pragma unroll
+    for (int mi = 0; mi < MI; ++mi) {
+        const int r0 = m0 + wm * C::WTM + mi * 16 + gid, r1 = r0 + 8;
+        const int e0 = ev[mi][0], e1 = ev[mi][1];
         uint32_t mx0 = 0, mx1 = 0;
         #pragma unroll
         for (int ni = 0; ni < NI; ++ni) {
             const int n = n0 + (wn * NI + ni) * 8 + t4 * 2;
             if (n >= Nreal) continue;
-            const int4 c0 = cst[n], c1 = cst[n + 1];
+            const int4 c0 = scst[n - n0], c1 = scst[n - n0 + 1];
             #pragma unroll
             for (int h = 0; h < 2; ++h) {
                 const int r = h ? r1 : r0; if (r >= Mreal) continue;
                 const int er = h ? e1 : e0;
-                int y0 = epi1(acc[0][mi][ni][2 * h], acc[1][mi][ni][2 * h], c0, er), y1 = epi1(acc[0][mi][ni][2 * h + 1], acc[1][mi][ni][2 * h + 1], c1, er);
+                int y0 = FAST ? epi1f(acc[0][mi][ni][2 * h], acc[1][mi][ni][2 * h], c0, er) : epi1(acc[0][mi][ni][2 * h], acc[1][mi][ni][2 * h], c0, er);
+                int y1 = FAST ? epi1f(acc[0][mi][ni][2 * h + 1], acc[1][mi][ni][2 * h + 1], c1, er) : epi1(acc[0][mi][ni][2 * h + 1], acc[1][mi][ni][2 * h + 1], c1, er);
                 if (EPI == EPI_PLAIN || EPI == EPI_GELU) {
                     if (EPI == EPI_GELU) { y0 = int(sat32(rshr(i64(y0) * lut16i(y0, Lphi), 16))); y1 = int(sat32(rshr(i64(y1) * lut16i(y1, Lphi), 16))); }
                     int32_t* dst = Y + size_t(r) * ldy + n;
@@ -266,6 +301,8 @@ __global__ void __launch_bounds__(NTHR) gemm_hl_k(const ASrc A, int Mreal, const
             if (t4 == 0) { if (r0 < Mreal && mx0) atomicMax(E.rowmax + r0, mx0); if (r1 < Mreal && mx1) atomicMax(E.rowmax + r1, mx1); }
         }
     }
+    };
+    if (fast) epilogue(std::true_type{}); else epilogue(std::false_type{});
     if (EPI == EPI_PLAIN && gnsm) {
         __syncthreads();
         if (tid < 32 && gnsm[64 + tid] != INT_MAX) { GnStat* g = gnst + (m0 / E.gnT) * 32 + tid; atomicAdd((unsigned long long*)&g->sum, (unsigned long long)reinterpret_cast<i64*>(gnsm)[tid]); atomicMin(&g->mn, gnsm[64 + tid]); atomicMax(&g->mx, gnsm[96 + tid]); }
@@ -281,10 +318,10 @@ template <int EPI, int SRC, class C> void launch(dim3 grid, cudaStream_t st, con
     int device = -1;
     CUDA_CHECK(cudaGetDevice(&device));
     if (attrDevice != device) {
-        CUDA_CHECK(cudaFuncSetAttribute(gemm_hl_k<EPI, SRC, C>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM));
+        CUDA_CHECK(cudaFuncSetAttribute(gemm_hl_k<EPI, SRC, C>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM_TOTAL));
         attrDevice = device;
     }
-    gemm_hl_k<EPI, SRC, C><<<grid, NTHR, C::SMEM, st>>>(A, Mreal, W, ldw, Nreal, Kp, cst, E);
+    gemm_hl_k<EPI, SRC, C><<<grid, NTHR, C::SMEM_TOTAL, st>>>(A, Mreal, W, ldw, Nreal, Kp, cst, E);
 }
 template <int SRC, class C> void launch_epi(int epi, dim3 grid, cudaStream_t st, const ASrc& A, int Mreal, const int8_t* W, int ldw, int Nreal, int Kp, const int4* cst, const AEpi& E) {
     switch (epi) {

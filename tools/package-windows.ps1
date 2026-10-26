@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
-$stage = Join-Path $env:RUNNER_TEMP 'supr-meow-vela-0.1.5-windows-x86_64'
+$stage = Join-Path $env:RUNNER_TEMP 'supr-meow-vela-0.1.6-windows-x86_64'
 Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $stage | Out-Null
 
@@ -16,7 +16,7 @@ Get-ChildItem "$env:CUDA_PATH/bin" -Filter '*.dll' -Recurse |
 
 Copy-Item windows/* $stage
 Copy-Item LICENSE,NOTICE $stage
-Copy-Item RELEASE-v0.1.5.md $stage
+Copy-Item RELEASE-v0.1.6.md $stage
 
 $licenses = Join-Path $stage 'licenses'
 New-Item -ItemType Directory -Force $licenses | Out-Null
@@ -30,7 +30,7 @@ if (Test-Path "$env:CUDA_PATH/installed-components.json") {
 }
 
 $info = @{
-    version = '0.1.5'; source_commit = (& git rev-parse HEAD).Trim()
+    version = '0.1.6'; source_commit = (& git rev-parse HEAD).Trim()
     ci_run = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
     platform = 'native-windows-x86_64'; cuda = '13.3'; architectures = @(80,86,89,90,100,120)
     cpu_selftest = 'passed'; windows_gpu_hardware_test = $false
@@ -50,7 +50,7 @@ Get-ChildItem $stage -File -Recurse | Sort-Object FullName | ForEach-Object {
 } | Set-Content "$stage/SHA256SUMS.txt"
 
 New-Item -ItemType Directory -Force dist | Out-Null
-$zip = Join-Path $root 'dist/supr-meow-vela-0.1.5-windows-x86_64.zip'
+$zip = Join-Path $root 'dist/supr-meow-vela-0.1.6-windows-x86_64.zip'
 Compress-Archive -Path "$stage/*" -DestinationPath $zip -Force
 "{0}  {1}" -f (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant(), (Split-Path $zip -Leaf) | Set-Content "$zip.sha256"
 Write-Host "Packaged $zip"

@@ -54,7 +54,7 @@ expected checksum for an explicitly selected model.
 ./supr-meow-vela --bench 20 --batch 8     # throughput
 ./supr-meow-vela --verify-server --port 9010 --mem 1024 --batch 1   # pool verifier (HTTP POST /verify, GET /health)
 ```
-Version 0.1.5 measured **138.60 inf/s on RTX 5090** (600 W cap) and **53.43 inf/s on RTX 4070 Ti SUPER** (285 W cap), both at batch 4 × 2 lanes: **+2.66%** and **+2.43%** over 0.1.4 with matched settings. A separate RTX 5090 profile using `--batch 2 --lanes 4 --mem 1400` reached **139.22 inf/s**. See [release notes](RELEASE-v0.1.5.md) for measurement conditions.
+Version 0.1.6 measured **152.04 inf/s on RTX 5090** (600 W cap) at batch 4 × 2 lanes: **+9.6%** over 0.1.5 with matched settings (138.78 inf/s). Outputs are bit-identical to the reference; the test vector and attention/normalization checks also pass on CMP 170HX (SM 80) and RTX 3070 (SM 86). Results depend on clocks, power limits and cooling.
 
 ## Build
 CUDA 12.8+ (13.3 used for releases), CMake ≥ 3.24, gcc 13. `cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j`.
